@@ -1,0 +1,11 @@
+# Bỏ qua toàn bộ nội dung trong thư mục storage
+storage/
+
+# Bỏ qua môi trường ảo (virtual environment)
+env/
+
+# Bỏ qua các file cache biên dịch của Python
+__pycache__/
+*.pyc
+
+.env
