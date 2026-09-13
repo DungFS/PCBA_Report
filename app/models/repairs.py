@@ -38,6 +38,7 @@ class Repair(Base, AuditMixin):
         nullable=True,
         comment="Kết quả test bằng công cụ đo ban đầu, là lý do board được gửi sửa"
     )
+    
     failure_cause = Column(
         Text, nullable=True,
         comment="Nguyên nhân gây lỗi sau khi phân tích, vd sai giá trị linh kiện U12, hỏng C46"

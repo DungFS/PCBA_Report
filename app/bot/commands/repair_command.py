@@ -23,6 +23,8 @@ class RepairCommand(BaseCommand):
     _add_sessions = {}
     # Session tạm cho flow "detail" (chọn Board -> thiết bị -> record) - key = chat_id
     _detail_sessions = {}
+    # Session tạm cho flow "update" (chọn Board -> thiết bị -> record -> field) - key = chat_id
+    _update_sessions = {}
 
     def register(self):
         # Không truyền admin=True -> BaseCommand.register_handler mặc định dùng
@@ -37,7 +39,7 @@ class RepairCommand(BaseCommand):
                 self._show_menu(message.chat.id)
                 return
             sub = args[0].lower()
-            if sub in ("search", "detail") and not self._require_admin(message):
+            if sub in ("search", "detail", "update") and not self._require_admin(message):
                 return
             self._dispatch(sub, message.chat.id, args[1:])
 
@@ -47,7 +49,12 @@ class RepairCommand(BaseCommand):
         @self.auth
         def handle_callback(call):
             action = call.data.split(":")[1] if ":" in call.data else None
-            admin_gated_actions = ("search", "detail", "detailboard", "detaildevice", "detailrecord")
+            admin_gated_actions = (
+                "search", "detail", "detailboard", "detaildevice", "detailrecord",
+                "update", "updateboard", "updaterecord",
+                "updatefield", "updatetest", "updateafter", "updatestation",
+                "updatecontractor", "updatedone",
+            )
             if action in admin_gated_actions and not self._require_admin(call):
                 return
             try:
@@ -94,6 +101,8 @@ class RepairCommand(BaseCommand):
                 self._start_search(chat_id)
         elif sub == "detail":
             self._start_detail_search(chat_id)
+        elif sub == "update":
+            self._start_update_search(chat_id)
         else:
             self._show_help(chat_id, unknown=sub)
 
@@ -106,6 +115,7 @@ class RepairCommand(BaseCommand):
         markup.add(InlineKeyboardButton("➕ Thêm mới", callback_data=f"{CB_PREFIX}:add"))
         markup.add(InlineKeyboardButton("🔍 Tra cứu theo Code (Admin)", callback_data=f"{CB_PREFIX}:search"))
         markup.add(InlineKeyboardButton("🔎 Tra cứu chi tiết (Admin)", callback_data=f"{CB_PREFIX}:detail"))
+        markup.add(InlineKeyboardButton("✏️ Cập nhật (Admin)", callback_data=f"{CB_PREFIX}:update"))
         self.bot.send_message(chat_id, "🔧 Quản lý Repair - chọn 1 thao tác:", reply_markup=markup)
 
     def _show_help(self, chat_id, unknown=None):
@@ -116,6 +126,7 @@ class RepairCommand(BaseCommand):
         lines.append("  /repair add           - thêm repair mới (mọi user đã xác thực)")
         lines.append("  /repair search <code> - tra cứu lịch sử sửa chữa theo mã thiết bị (chỉ Admin)")
         lines.append("  /repair detail        - tra cứu chi tiết 1 record theo luồng chọn Board -> thiết bị -> record (chỉ Admin)")
+        lines.append("  /repair update         - cập nhật 1 record đã có, theo cùng luồng chọn Board -> thiết bị -> record (chỉ Admin)")
         self.bot.send_message(chat_id, "\n".join(lines))
 
     # ------------------------------------------------------------------
@@ -326,6 +337,371 @@ class RepairCommand(BaseCommand):
         return "\n".join(lines)
 
     # ==================================================================
+    # UPDATE - sửa 1 record đã có, theo luồng chọn Board -> thiết bị ->
+    # record (giống hệt DETAIL) -> chọn field cần sửa -> nhập giá trị mới.
+    # Sửa xong quay lại menu field để sửa tiếp field khác, hoặc bấm Xong.
+    # CHỈ ADMIN.
+    # ==================================================================
+
+    # (label hiển thị, tên field trong model) - đủ các field text/enum quan
+    # trọng. KHÔNG cho sửa board_code/code (đổi sẽ làm sai lệch định danh
+    # thiết bị) và không cho sửa ảnh qua đây (upload lại phức tạp, để làm sau
+    # nếu cần).
+    UPDATE_FIELDS = [
+        ("Test tool result", "test_tool_result"),
+        ("Failure cause", "failure_cause"),
+        ("Disposition", "disposition"),
+        ("After repair result", "after_repair_result"),
+        ("Charging station test status", "charging_station_test_status"),
+        ("Nhà thầu", "contractor_id"),
+        ("Ticket ID", "ticket_id"),
+        ("SN", "sn"),
+        ("Date onsite", "date_onsite"),
+        ("Original phenomenon", "original_phenomenon"),
+        ("Station code", "station_code"),
+        ("Detailed remarks", "detailed_remarks"),
+        ("Push FW", "puss_f"),
+    ]
+    UPDATE_FIELD_LABELS = dict(UPDATE_FIELDS)
+
+    def _start_update_search(self, chat_id):
+        self._update_sessions[chat_id] = {}
+
+        with SessionLocal() as db:
+            boards = db.query(Board).order_by(Board.id).all()
+
+        if not boards:
+            self.bot.send_message(chat_id, "❌ Chưa có board nào trong danh mục.")
+            return
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        for b in boards:
+            label = b.code + (f" - {b.ten}" if b.ten else "")
+            markup.add(InlineKeyboardButton(label, callback_data=f"{CB_PREFIX}:updateboard:{b.id}"))
+        markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+
+        self.bot.send_message(chat_id, "✏️ Cập nhật Repair\n\nBước 1: Chọn Board:", reply_markup=markup)
+
+    def _handle_update_board_selected(self, chat_id, board_id):
+        with SessionLocal() as db:
+            board = db.query(Board).filter(Board.id == board_id).first()
+            if not board:
+                self.bot.send_message(chat_id, "❌ Board không tồn tại (có thể đã bị xóa).")
+                self._update_sessions.pop(chat_id, None)
+                return
+
+            board_code = board.code
+            codes = [
+                row[0] for row in
+                db.query(Repair.code)
+                .filter(Repair.board_code == board_code, Repair.code.isnot(None))
+                .distinct()
+                .all()
+            ]
+
+        if not codes:
+            self.bot.send_message(chat_id, f"❌ Chưa có thiết bị nào (chưa có repair) của board '{board_code}'.")
+            self._update_sessions.pop(chat_id, None)
+            return
+
+        self._update_sessions[chat_id] = {"codes": codes}
+
+        # Bắt buộc gõ ĐÚNG mã thiết bị (exact match) - giống flow ADD, không
+        # liệt kê danh sách bằng nút (có thể rất dài).
+        msg = self.bot.send_message(
+            chat_id,
+            f"Board này có {len(codes)} thiết bị.\n"
+            f"Bước 2: Nhập ĐÚNG mã thiết bị (bắt buộc):\nGõ /cancel để hủy."
+        )
+        self.bot.register_next_step_handler(msg, self._guarded_admin(self._process_update_device_exact))
+
+    def _process_update_device_exact(self, message):
+        chat_id = message.chat.id
+        session = self._update_sessions.get(chat_id)
+        if not session or "codes" not in session:
+            self.bot.reply_to(message, "⚠️ Phiên cập nhật đã hết hạn. Gõ /repair update để bắt đầu lại.")
+            return
+        if self._is_cancel(message):
+            self._update_sessions.pop(chat_id, None)
+            self.bot.reply_to(message, "❎ Đã hủy cập nhật.")
+            return
+
+        query = (message.text or "").strip()
+        if not query:
+            msg = self.bot.reply_to(message, "❌ Bắt buộc nhập mã thiết bị. Nhập lại:")
+            self.bot.register_next_step_handler(msg, self._guarded_admin(self._process_update_device_exact))
+            return
+
+        codes = session.get("codes", [])
+        exact_matches = [c for c in codes if c.lower() == query.lower()]
+
+        if not exact_matches:
+            msg = self.bot.reply_to(
+                message,
+                f"❌ Không tìm thấy thiết bị nào có mã chính xác là '{query}'.\n"
+                f"Nhập lại ĐÚNG mã thiết bị (bắt buộc):"
+            )
+            self.bot.register_next_step_handler(msg, self._guarded_admin(self._process_update_device_exact))
+            return
+
+        session.pop("codes", None)
+        self._show_update_record_list(message.chat.id, exact_matches[0], reply_to=message)
+
+    def _show_update_record_list(self, chat_id, code, reply_to=None):
+        with SessionLocal() as db:
+            repairs = (
+                db.query(Repair)
+                .filter(Repair.code == code)
+                .order_by(Repair.id.desc())
+                .all()
+            )
+
+        send = (lambda text, **kw: self.bot.reply_to(reply_to, text, **kw)) if reply_to else \
+               (lambda text, **kw: self.bot.send_message(chat_id, text, **kw))
+
+        if not repairs:
+            send(f"❌ Không còn record nào cho thiết bị '{code}'.")
+            self._update_sessions.pop(chat_id, None)
+            return
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        for r in repairs:
+            status = r.test_tool_result.value if r.test_tool_result else "-"
+            label = f"#{r.id} - {status} - Ticket: {r.ticket_id or '-'}"
+            markup.add(InlineKeyboardButton(label, callback_data=f"{CB_PREFIX}:updaterecord:{r.id}"))
+        markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+
+        send(f"Bước 3: Chọn record của thiết bị '{code}' cần cập nhật:", reply_markup=markup)
+
+    def _handle_update_record_selected(self, chat_id, repair_id):
+        with SessionLocal() as db:
+            r = db.query(Repair).options(joinedload(Repair.created_by)).filter(Repair.id == repair_id).first()
+
+        if not r:
+            self.bot.send_message(chat_id, f"❌ Không tìm thấy repair #{repair_id} (có thể đã bị xóa).")
+            self._update_sessions.pop(chat_id, None)
+            return
+
+        self._update_sessions[chat_id] = {"repair_id": repair_id}
+        self.bot.send_message(chat_id, self._format_repair_full_detail(r))
+        self._show_update_field_menu(chat_id)
+
+    def _get_repair_for_update(self, chat_id):
+        """Lấy lại Repair (kèm contractor) theo repair_id trong session update -
+        dùng để hiển thị giá trị hiện tại. Trả về None nếu session/record mất,
+        và tự gửi thông báo lỗi phù hợp trong trường hợp đó."""
+        session = self._update_sessions.get(chat_id)
+        repair_id = session.get("repair_id") if session else None
+        if not repair_id:
+            self.bot.send_message(chat_id, "⚠️ Phiên cập nhật đã hết hạn. Gõ /repair update để bắt đầu lại.")
+            return None
+
+        with SessionLocal() as db:
+            r = db.query(Repair).options(joinedload(Repair.contractor)).filter(Repair.id == repair_id).first()
+
+        if not r:
+            self.bot.send_message(chat_id, f"❌ Không tìm thấy repair #{repair_id} (có thể đã bị xóa).")
+            self._update_sessions.pop(chat_id, None)
+            return None
+
+        return r
+
+    @staticmethod
+    def _format_field_value(r, field):
+        if field in ("test_tool_result", "after_repair_result"):
+            v = getattr(r, field, None)
+            return v.value if v else "-"
+        if field == "contractor_id":
+            return r.contractor.name if getattr(r, "contractor", None) else "-"
+        if field == "date_onsite":
+            return r.date_onsite.isoformat() if getattr(r, "date_onsite", None) else "-"
+        value = getattr(r, field, None)
+        return str(value) if value not in (None, "") else "-"
+
+    def _show_update_field_menu(self, chat_id):
+        r = self._get_repair_for_update(chat_id)
+        if not r:
+            return
+
+        lines = ["Chọn field cần cập nhật (giá trị hiện tại ghi bên cạnh):", ""]
+        for label, field in self.UPDATE_FIELDS:
+            lines.append(f"  {label}: {self._format_field_value(r, field)}")
+
+        markup = InlineKeyboardMarkup(row_width=1)
+        for label, field in self.UPDATE_FIELDS:
+            markup.add(InlineKeyboardButton(f"✏️ {label}", callback_data=f"{CB_PREFIX}:updatefield:{field}"))
+        markup.add(InlineKeyboardButton("✅ Xong", callback_data=f"{CB_PREFIX}:updatedone"))
+        markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+        self.bot.send_message(chat_id, "\n".join(lines), reply_markup=markup)
+
+    def _handle_update_done(self, chat_id):
+        self._update_sessions.pop(chat_id, None)
+        self.bot.send_message(chat_id, "✅ Đã hoàn tất cập nhật.")
+
+    def _handle_update_field_selected(self, chat_id, field):
+        session = self._update_sessions.get(chat_id)
+        if not session or "repair_id" not in session:
+            self.bot.send_message(chat_id, "⚠️ Phiên cập nhật đã hết hạn. Gõ /repair update để bắt đầu lại.")
+            return
+
+        r = self._get_repair_for_update(chat_id)
+        if not r:
+            return
+
+        label = self.UPDATE_FIELD_LABELS.get(field, field)
+        current_value = self._format_field_value(r, field)
+        current_line = f"Giá trị hiện tại: {current_value}\n"
+
+        if field == "test_tool_result":
+            markup = InlineKeyboardMarkup(row_width=1)
+            markup.add(
+                InlineKeyboardButton("✅ PASS", callback_data=f"{CB_PREFIX}:updatetest:PASS"),
+                InlineKeyboardButton("❌ FAIL", callback_data=f"{CB_PREFIX}:updatetest:FAIL"),
+                InlineKeyboardButton("🗑 DISCARD", callback_data=f"{CB_PREFIX}:updatetest:DISCARD"),
+            )
+            markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+            self.bot.send_message(chat_id, f"{current_line}Chọn giá trị mới cho '{label}':", reply_markup=markup)
+            return
+
+        if field == "after_repair_result":
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("✅ PASS", callback_data=f"{CB_PREFIX}:updateafter:PASS"),
+                InlineKeyboardButton("❌ FAIL", callback_data=f"{CB_PREFIX}:updateafter:FAIL"),
+            )
+            markup.add(InlineKeyboardButton("🚫 Bỏ trống", callback_data=f"{CB_PREFIX}:updateafter:CLEAR"))
+            markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+            self.bot.send_message(chat_id, f"{current_line}Chọn giá trị mới cho '{label}':", reply_markup=markup)
+            return
+
+        if field == "charging_station_test_status":
+            markup = InlineKeyboardMarkup(row_width=2)
+            markup.add(
+                InlineKeyboardButton("⏳ Pending", callback_data=f"{CB_PREFIX}:updatestation:pending"),
+                InlineKeyboardButton("✅ OK", callback_data=f"{CB_PREFIX}:updatestation:ok"),
+            )
+            markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+            self.bot.send_message(chat_id, f"{current_line}Chọn giá trị mới cho '{label}':", reply_markup=markup)
+            return
+
+        if field == "contractor_id":
+            with SessionLocal() as db:
+                contractors = db.query(Contractor).order_by(Contractor.id).all()
+            if not contractors:
+                self.bot.send_message(chat_id, "❌ Chưa có nhà thầu nào trong danh mục (dùng /contractor add để thêm).")
+                self._show_update_field_menu(chat_id)
+                return
+            markup = InlineKeyboardMarkup(row_width=1)
+            for c in contractors:
+                markup.add(InlineKeyboardButton(c.name, callback_data=f"{CB_PREFIX}:updatecontractor:{c.id}"))
+            markup.add(InlineKeyboardButton("🚫 Bỏ trống", callback_data=f"{CB_PREFIX}:updatecontractor:clear"))
+            markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
+            self.bot.send_message(chat_id, f"{current_line}Chọn giá trị mới cho '{label}':", reply_markup=markup)
+            return
+
+        # Các field còn lại: nhập text tự do. Gõ '-' để xóa trắng (set NULL).
+        session["_editing_field"] = field
+        msg = self.bot.send_message(
+            chat_id,
+            f"{current_line}Nhập giá trị mới cho '{label}':\nGõ '-' để xóa trắng, hoặc /cancel để hủy."
+        )
+        self.bot.register_next_step_handler(msg, self._guarded_admin(self._process_update_text_field))
+
+    def _process_update_text_field(self, message):
+        chat_id = message.chat.id
+        session = self._update_sessions.get(chat_id)
+        if not session or "repair_id" not in session:
+            self.bot.reply_to(message, "⚠️ Phiên cập nhật đã hết hạn. Gõ /repair update để bắt đầu lại.")
+            return
+        if self._is_cancel(message):
+            self._update_sessions.pop(chat_id, None)
+            self.bot.reply_to(message, "❎ Đã hủy cập nhật.")
+            return
+
+        field = session.get("_editing_field")
+        raw = (message.text or "").strip()
+        value = None if raw == "-" else raw
+
+        if field == "date_onsite" and value is not None:
+            parsed, err = self._parse_date(value)
+            if err:
+                msg = self.bot.reply_to(message, f"❌ {err}\nNhập lại (vd 8/17/2026), hoặc '-' để xóa trắng:")
+                self.bot.register_next_step_handler(msg, self._guarded_admin(self._process_update_text_field))
+                return
+            value = parsed
+
+        self._apply_update(message, {field: value})
+
+    def _apply_update(self, message, field_values: dict):
+        chat_id = message.chat.id
+        session = self._update_sessions.get(chat_id)
+        repair_id = session.get("repair_id") if session else None
+        if not repair_id:
+            self.bot.reply_to(message, "⚠️ Phiên cập nhật đã hết hạn. Gõ /repair update để bắt đầu lại.")
+            return
+
+        with SessionLocal() as db:
+            r = db.query(Repair).filter(Repair.id == repair_id).first()
+            if not r:
+                self.bot.reply_to(message, f"❌ Không tìm thấy repair #{repair_id} (có thể đã bị xóa).")
+                self._update_sessions.pop(chat_id, None)
+                return
+            try:
+                for field, value in field_values.items():
+                    setattr(r, field, value)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                self.bot.reply_to(message, f"❌ Cập nhật thất bại: {e}")
+                return
+
+        session.pop("_editing_field", None)
+        self.bot.reply_to(message, "✅ Đã cập nhật.")
+        self._show_update_field_menu(chat_id)
+
+    def _handle_update_test_selected(self, chat_id, value):
+        self._apply_update_from_callback(chat_id, {"test_tool_result": self._to_enum(value)})
+
+    def _handle_update_after_selected(self, chat_id, value):
+        new_value = None if value == "CLEAR" else self._to_enum(value)
+        self._apply_update_from_callback(chat_id, {"after_repair_result": new_value})
+
+    def _handle_update_station_selected(self, chat_id, value):
+        self._apply_update_from_callback(chat_id, {"charging_station_test_status": value})
+
+    def _handle_update_contractor_selected(self, chat_id, value):
+        new_value = None if value == "clear" else int(value)
+        self._apply_update_from_callback(chat_id, {"contractor_id": new_value})
+
+    def _apply_update_from_callback(self, chat_id, field_values: dict):
+        """Giống _apply_update nhưng gọi từ callback (nút bấm) thay vì next-step
+        message - không có 1 Message thật để reply_to, nên dùng send_message
+        thẳng vào chat_id."""
+        session = self._update_sessions.get(chat_id)
+        repair_id = session.get("repair_id") if session else None
+        if not repair_id:
+            self.bot.send_message(chat_id, "⚠️ Phiên cập nhật đã hết hạn. Gõ /repair update để bắt đầu lại.")
+            return
+
+        with SessionLocal() as db:
+            r = db.query(Repair).filter(Repair.id == repair_id).first()
+            if not r:
+                self.bot.send_message(chat_id, f"❌ Không tìm thấy repair #{repair_id} (có thể đã bị xóa).")
+                self._update_sessions.pop(chat_id, None)
+                return
+            try:
+                for field, value in field_values.items():
+                    setattr(r, field, value)
+                db.commit()
+            except Exception as e:
+                db.rollback()
+                self.bot.send_message(chat_id, f"❌ Cập nhật thất bại: {e}")
+                return
+
+        self.bot.send_message(chat_id, "✅ Đã cập nhật.")
+        self._show_update_field_menu(chat_id)
+
+    # ==================================================================
     # ADD - wizard nhiều bước (gộp từ command_board_command.py cũ)
     # ==================================================================
 
@@ -360,7 +736,7 @@ class RepairCommand(BaseCommand):
 
             board_code = board.code
             self._add_sessions[chat_id]["board_code"] = board_code
-            self._add_sessions[chat_id]["board_id"] = board.ten
+            self._add_sessions[chat_id]["board_name"] = board.ten
 
             existing_codes = [
                 row[0] for row in
@@ -507,23 +883,19 @@ class RepairCommand(BaseCommand):
         markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
         self.bot.send_message(chat_id, "Bước 3: Kết quả test (test_tool_result):", reply_markup=markup)
 
-    # Nếu chọn Discard ngay ở bước test_tool_result: coi như test FAIL (lý do
-    # discard), bỏ qua toàn bộ bước failure_cause/disposition/after_repair/ảnh,
-    # đi thẳng sang charging_station_test_status.
+    # Nếu chọn Discard ngay ở bước test_tool_result: đi thẳng sang ticket_id,
+    # bỏ qua toàn bộ bước failure_cause/disposition/after_repair/ảnh.
     SKIP_REPAIR_DISPOSITIONS = ("Discard",)
 
     def _handle_add_test_selected(self, chat_id, value):
-        if value == "DISCARD":
-            self._add_sessions[chat_id]["test_tool_result"] = "FAIL"
-            self._add_sessions[chat_id]["disposition"] = "Discard"
-            self._ask_ticket_id(chat_id)
-            return
-
         self._add_sessions[chat_id]["test_tool_result"] = value
 
-        if value == "PASS":
+        if value == "DISCARD":
+            self._add_sessions[chat_id]["disposition"] = "Discard"
             self._ask_ticket_id(chat_id)
-        else:
+        elif value == "PASS":
+            self._ask_ticket_id(chat_id)
+        else:  # FAIL
             msg = self.bot.send_message(chat_id, "❌ FAIL - Nhập failure_cause (nguyên nhân lỗi):\nGõ /cancel để hủy.")
             self.bot.register_next_step_handler(msg, self._guarded(self._process_add_failure_cause))
 
@@ -756,7 +1128,7 @@ class RepairCommand(BaseCommand):
             try:
                 repair = Repair(
                     date_receive=datetime.now().date(),
-                    board_id=data.get("board_id"),
+                    board_id=data.get("board_name") or data.get("board_code"),
                     board_code=data.get("board_code"),
                     contractor_id=data.get("contractor_id"),
                     code=data.get("code"),
@@ -795,7 +1167,9 @@ class RepairCommand(BaseCommand):
             f"  Thiết bị (code): {data.get('code')}",
             f"  Test tool result: {data.get('test_tool_result')}",
         ]
-        if data.get("test_tool_result") == "FAIL":
+        if data.get("test_tool_result") == "DISCARD":
+            summary_lines.append(f"  Disposition: {data.get('disposition')}")
+        elif data.get("test_tool_result") == "FAIL":
             summary_lines.append(f"  Failure cause: {data.get('failure_cause')}")
             summary_lines.append(f"  Disposition: {data.get('disposition')}")
             if data.get("disposition") not in self.SKIP_REPAIR_DISPOSITIONS:
@@ -858,7 +1232,7 @@ class RepairCommand(BaseCommand):
         msg = self.bot.send_message(
             chat_id,
             f"📷 Gửi ảnh {label} (tối đa {max_count} ảnh).\n"
-            f"Gửi ảnh, hoặc gõ '-' để bỏ qua.\nGõ /cancel để hủy."
+            f"Gửi ảnh, hoặc gõ 'xong' để bỏ qua/kết thúc.\nGõ /cancel để hủy."
         )
         self.bot.register_next_step_handler(msg, self._guarded(self._process_photo_batch))
 
@@ -881,7 +1255,7 @@ class RepairCommand(BaseCommand):
             return
 
         text = (message.text or "").strip().lower()
-        if text in ("done", "-", "skip"):
+        if text in ("xong", "done", "-", "skip"):
             session.pop("_photo_batch", None)
             session.pop("_photo_batch_on_done", None)
             on_done(chat_id)
@@ -890,7 +1264,7 @@ class RepairCommand(BaseCommand):
         if not message.photo:
             msg = self.bot.reply_to(
                 message,
-                "❌ Vui lòng gửi ảnh, hoặc gõ '-' để bỏ qua."
+                "❌ Vui lòng gửi ảnh, hoặc gõ 'xong' để bỏ qua/kết thúc."
             )
             self.bot.register_next_step_handler(msg, self._guarded(self._process_photo_batch))
             return
@@ -917,7 +1291,7 @@ class RepairCommand(BaseCommand):
         session["_photo_batch"] = batch
         msg = self.bot.reply_to(
             message,
-            f"✅ Đã lưu ảnh {count}/{batch['max']} ({batch['label']}). Gửi thêm ảnh, hoặc gõ '-':"
+            f"✅ Đã lưu ảnh {count}/{batch['max']} ({batch['label']}). Gửi thêm ảnh, hoặc gõ 'xong':"
         )
         self.bot.register_next_step_handler(msg, self._guarded(self._process_photo_batch))
 
@@ -927,6 +1301,10 @@ class RepairCommand(BaseCommand):
 
     ADD_FLOW_ACTIONS = ("addboard", "devicesearch", "devicenew", "addcontractor", "addtest", "addafter", "addstation")
     DETAIL_FLOW_ACTIONS = ("detailboard", "detaildevice", "detailrecord")
+    UPDATE_FLOW_ACTIONS = (
+        "updateboard", "updaterecord", "updatefield",
+        "updatetest", "updateafter", "updatestation", "updatecontractor", "updatedone",
+    )
 
     def _route_callback(self, call):
         chat_id = call.message.chat.id
@@ -936,6 +1314,7 @@ class RepairCommand(BaseCommand):
         if action == "cancel":
             self._add_sessions.pop(chat_id, None)
             self._detail_sessions.pop(chat_id, None)
+            self._update_sessions.pop(chat_id, None)
             self.bot.send_message(chat_id, "❎ Đã hủy.")
             return
 
@@ -950,7 +1329,15 @@ class RepairCommand(BaseCommand):
             )
             return
 
-        if action in ("add", "search", "detail"):
+        if action in self.UPDATE_FLOW_ACTIONS and chat_id not in self._update_sessions:
+            self.bot.send_message(
+                chat_id,
+                "⚠️ Phiên cập nhật Repair đã hết hạn hoặc không còn tồn tại.\n"
+                "Gõ /repair update để bắt đầu lại."
+            )
+            return
+
+        if action in ("add", "search", "detail", "update"):
             self._dispatch(action, chat_id)
         elif action == "addboard":
             self._handle_add_board_selected(chat_id, int(parts[2]))
@@ -972,6 +1359,22 @@ class RepairCommand(BaseCommand):
             self._handle_detail_device_selected(chat_id, parts[2])
         elif action == "detailrecord":
             self._handle_detail_record_selected(chat_id, int(parts[2]))
+        elif action == "updateboard":
+            self._handle_update_board_selected(chat_id, int(parts[2]))
+        elif action == "updaterecord":
+            self._handle_update_record_selected(chat_id, int(parts[2]))
+        elif action == "updatefield":
+            self._handle_update_field_selected(chat_id, parts[2])
+        elif action == "updatetest":
+            self._handle_update_test_selected(chat_id, parts[2])
+        elif action == "updateafter":
+            self._handle_update_after_selected(chat_id, parts[2])
+        elif action == "updatestation":
+            self._handle_update_station_selected(chat_id, parts[2])
+        elif action == "updatecontractor":
+            self._handle_update_contractor_selected(chat_id, parts[2])
+        elif action == "updatedone":
+            self._handle_update_done(chat_id)
 
     # ==================================================================
     # Helpers dùng chung

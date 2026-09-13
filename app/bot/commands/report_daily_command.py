@@ -82,6 +82,7 @@ class ReportDailyCommand(BaseCommand):
         summary = defaultdict(lambda: {
             "tt_pass": 0, 
             "tt_fail": 0, 
+            "tt_discard": 0,
             "ar_pass": 0, 
             "ar_fail": 0
         })
@@ -103,6 +104,8 @@ class ReportDailyCommand(BaseCommand):
                 summary[key]["tt_pass"] += 1
             elif t_tool == "fail":
                 summary[key]["tt_fail"] += 1
+            elif t_tool == "discard":
+                summary[key]["tt_discard"] += 1
                 
             if a_repair == "pass":
                 summary[key]["ar_pass"] += 1
@@ -121,6 +124,7 @@ class ReportDailyCommand(BaseCommand):
                 "c_name": c_name,
                 "tt_pass": counts["tt_pass"],
                 "tt_fail": counts["tt_fail"],
+                "tt_discard": counts["tt_discard"],
                 "ar_pass": counts["ar_pass"],
                 "ar_fail": counts["ar_fail"],
             })
@@ -131,14 +135,14 @@ class ReportDailyCommand(BaseCommand):
         final_rows = [
             [
                 r["date_str"], r["b_code"], r["b_name"], r["c_name"], 
-                r["tt_pass"], r["tt_fail"], r["ar_pass"], r["ar_fail"]
+                r["tt_pass"], r["tt_fail"], r["tt_discard"], r["ar_pass"], r["ar_fail"]
             ]
             for r in raw_rows
         ]
 
         columns = [
             "Date Receive", "Board Code", "Board Name", "Contractor", 
-            "Test Tool Pass", "Test Tool Fail", "After Repair Pass", "After Repair Fail"
+            "Test Tool Pass", "Test Tool Fail", "Discard", "After Repair Pass", "After Repair Fail"
         ]
 
         file_path = self._build_xlsx(columns, final_rows)
@@ -180,7 +184,7 @@ class ReportDailyCommand(BaseCommand):
             
             if h in ["Board Name", "Contractor"]:
                 ws.column_dimensions[get_column_letter(col_idx)].width = 30
-            elif "Pass" in h or "Fail" in h:
+            elif "Pass" in h or "Fail" in h or h == "Discard":
                 ws.column_dimensions[get_column_letter(col_idx)].width = 18
             else:
                 ws.column_dimensions[get_column_letter(col_idx)].width = 20
@@ -189,8 +193,8 @@ class ReportDailyCommand(BaseCommand):
             for col_idx, value in enumerate(row_values, start=1):
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)
                 cell.font = normal_font
-                # Căn giữa cho Ngày, Code và 4 cột đếm số lượng (cột 1, 2, 5, 6, 7, 8)
-                if col_idx in (1, 2, 5, 6, 7, 8):
+                # Căn giữa cho Ngày, Code và 5 cột đếm số lượng (cột 1, 2, 5, 6, 7, 8, 9)
+                if col_idx in (1, 2, 5, 6, 7, 8, 9):
                     cell.alignment = center
                 else:
                     cell.alignment = left

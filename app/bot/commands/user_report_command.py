@@ -116,8 +116,8 @@ class UserReportCommand(BaseCommand):
         with SessionLocal() as db:
             repairs = (
                 db.query(Repair)
-                .filter(Repair.created_at.isnot(None))
-                .filter(Repair.created_at >= period_start, Repair.created_at < period_end)
+                .filter(Repair.date_receive.isnot(None))
+                .filter(Repair.date_receive >= period_start, Repair.date_receive < period_end)
                 .all()
             )
             users = db.query(User).all()
@@ -131,7 +131,7 @@ class UserReportCommand(BaseCommand):
         for r in repairs:
             key = (r.created_by_id, r.board_code)
             entry = stats.setdefault(key, {
-                "codes": set(), "first_pass": 0, "after_pass": 0, "after_fail": 0, "discard": 0, "hold": 0
+                "codes": set(), "first_pass": 0, "after_pass": 0, "after_fail": 0, "discard": 0,
             })
             if r.code:
                 entry["codes"].add(r.code)
@@ -141,7 +141,7 @@ class UserReportCommand(BaseCommand):
                 entry["after_pass"] += 1
             if r.after_repair_result == TestResult.FAIL:
                 entry["after_fail"] += 1
-            if r.disposition == "Discard":
+            if r.test_tool_result == "DISCARD":
                 entry["discard"] += 1
 
         user_names = {u.id: (getattr(u, "full_name", None) or f"User #{u.id}") for u in users}
