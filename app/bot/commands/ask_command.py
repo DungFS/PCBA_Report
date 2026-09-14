@@ -1,20 +1,25 @@
 # app/bot/commands/ask_command.py
 """
 Lệnh /ask - CHỈ ADMIN được dùng. Cho phép hỏi đáp tự nhiên (tiếng Việt) về
-dữ liệu trong DB: đếm/liệt kê theo user, board, nhà thầu; tìm các lỗi có mô
-tả tương tự nhau (RAG - so khớp ngữ nghĩa, không chỉ khớp từ khoá); đề xuất
-cách sửa chữa dựa trên lịch sử đã sửa thành công...
+dữ liệu repair: tìm các lỗi có mô tả tương tự nhau (RAG - so khớp ngữ nghĩa,
+không chỉ khớp từ khoá), đề xuất cách sửa chữa dựa trên lịch sử đã sửa
+thành công, tra cứu/tóm tắt nội dung...
+
+/ask dùng RAG (semantic search) làm nguồn dữ liệu DUY NHẤT - không tự sinh
+SQL (bỏ do kém ổn định, xem app/services/nl_query_service.py). Vì vậy các
+câu hỏi ĐẾM/TỔNG HỢP SỐ LIỆU chỉ mang tính GẦN ĐÚNG; cần số liệu chính xác
+100% thì dùng /user_report, /repair_detail_report...
 
 Cách dùng:
-    /ask User A đã sửa được bao nhiêu board trong tháng này?
     /ask Liệt kê các lỗi tương tự lỗi "hỏng tụ C46"
     /ask Đề xuất cách sửa cho các board có hiện tượng giống board OCPP...KWA
+    /ask User A gần đây sửa những lỗi gì?
 
 Nếu gõ /ask không kèm câu hỏi, bot sẽ hỏi lại ở tin nhắn tiếp theo.
 
 Xử lý nghiệp vụ nằm ở:
-    - app/services/nl_query_service.py - sinh SQL, chạy SQL, tổng hợp câu trả lời.
-    - app/services/rag_service.py      - tìm lỗi tương tự theo ngữ nghĩa (RAG).
+    - app/services/rag_service.py      - tìm bản ghi tương tự theo ngữ nghĩa (RAG).
+    - app/services/nl_query_service.py - orchestrate RAG + tổng hợp câu trả lời.
 File này chỉ lo phần giao tiếp Telegram.
 """
 from app.bot.base_command import BaseCommand
@@ -85,19 +90,9 @@ class AskCommand(BaseCommand):
                 pass
 
         answer_text = result.answer_text.strip() or "(AI không trả về nội dung)"
-        header = (
-            f"🤖 KẾT QUẢ ({result.row_count} dòng SQL, "
-            f"{result.similar_count} lỗi tương tự qua RAG):\n\n"
-        )
+        header = f"🤖 KẾT QUẢ ({result.similar_count} bản ghi liên quan tìm được qua RAG):\n\n"
         for chunk in self._chunk_text(header + answer_text, MAX_MESSAGE_LEN):
             self._safe_send(message.chat.id, chunk)
-
-        # Gửi kèm câu SQL đã dùng để Admin có thể tự kiểm tra lại nếu cần.
-        self._safe_send(
-            message.chat.id,
-            f"🔎 SQL đã dùng:\n```sql\n{result.sql}\n```",
-            parse_mode="Markdown",
-        )
 
     def _safe_send(self, chat_id, text, parse_mode=None):
         """Gửi tin nhắn, tự fallback về plain text nếu parse_mode làm

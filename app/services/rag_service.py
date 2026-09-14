@@ -1,21 +1,14 @@
 # app/services/rag_service.py
 """
-RAG (Retrieval-Augmented Generation) cho tính năng /ask - tìm các repair có
-mô tả lỗi TƯƠNG TỰ NHAU theo NGỮ NGHĨA (không chỉ khớp từ khoá như LIKE
-trong nl_query_service.py), dùng vector embedding sinh LOCAL (xem
-app/services/embedding_service.py).
+RAG (Retrieval-Augmented Generation) - lõi retrieval cho tính năng /ask.
 
-Khác biệt với nl_query_service.py:
-    - nl_query_service.py : retrieval bằng SQL do AI sinh ra - CHÍNH XÁC cho
-      câu hỏi đếm/liệt kê/lọc theo điều kiện rõ ràng (vd "user A sửa được
-      bao nhiêu board"), nhưng yếu khi 2 lỗi diễn đạt khác từ mà cùng bản
-      chất (LIKE không bắt được).
-    - rag_service.py      : retrieval bằng cosine similarity giữa các vector
-      embedding - bắt được lỗi tương tự dù cách diễn đạt khác nhau (vd "chập
-      nguồn do ẩm" và "board vào nước gây ngắn mạch").
-
-/ask (xem nl_query_service.answer_question) dùng CẢ HAI, đưa kết quả của cả
-2 nguồn cho AI ở bước tổng hợp câu trả lời cuối cùng.
+/ask CHỈ dùng RAG (không còn text-to-SQL - AI tự sinh SQL tự do kém ổn
+định, hay lỗi cú pháp/hallucinate tên cột, đặc biệt với model free; xem
+lịch sử quyết định trong nl_query_service.py). Câu hỏi được embed thành
+vector, so khớp cosine similarity với embedding của từng repair để tìm các
+bản ghi GẦN NGHĨA nhất - bắt được lỗi tương tự dù cách diễn đạt khác nhau
+(vd "chập nguồn do ẩm" và "board vào nước gây ngắn mạch"), điều mà so khớp
+từ khoá (LIKE) không làm được.
 
 Lưu trữ: mỗi Repair có tối đa 1 dòng trong bảng `repair_embeddings` (xem
 app/models/repair_embedding.py), vector lưu dạng JSON. So khớp cosine
@@ -45,13 +38,21 @@ from app.services.embedding_service import get_embedding_service
 
 
 def _build_repair_text(repair: Repair) -> str:
-    """Chỉ lấy các field liên quan tới MÔ TẢ LỖI - ảnh, ticket_id, ngày
-    tháng... không giúp ích cho so khớp ngữ nghĩa, chỉ làm loãng vector."""
+    """Văn bản đại diện cho 1 repair, dùng để embed. Vì RAG giờ là NGUỒN DỮ
+    LIỆU DUY NHẤT của /ask (không còn SQL đối chiếu), đưa thêm vài field
+    định danh (người sửa, ngày nhận, kết quả test) ngoài mô tả lỗi thuần -
+    giúp các câu hỏi kiểu "user X đã làm gì" cũng có cơ hội khớp được, dù
+    RAG vẫn chủ yếu mạnh cho câu hỏi về NỘI DUNG lỗi hơn là lọc chính xác."""
+    creator = repair.created_by.full_name if getattr(repair, "created_by", None) else None
     fields = [
         ("Board", repair.board_code or repair.board_id),
+        ("Người thực hiện", creator),
+        ("Ngày nhận", repair.date_receive.isoformat() if repair.date_receive else None),
+        ("Test tool result", repair.test_tool_result.value if repair.test_tool_result else None),
         ("Hiện tượng ban đầu", repair.original_phenomenon),
         ("Nguyên nhân lỗi", repair.failure_cause),
         ("Cách xử lý", repair.disposition),
+        ("Kết quả sau sửa", repair.after_repair_result.value if repair.after_repair_result else None),
     ]
     lines = [f"{label}: {value}" for label, value in fields if value]
     return "\n".join(lines)
@@ -59,18 +60,23 @@ def _build_repair_text(repair: Repair) -> str:
 
 def reindex_repair(repair_id: int) -> None:
     """Tạo/cập nhật embedding cho 1 repair. Gọi mỗi khi repair được tạo mới
-    hoặc sửa field mô tả lỗi (xem hook trong repair_command.py). Best-effort
+    hoặc sửa field liên quan (xem hook trong repair_command.py). Best-effort
     theo thiết kế của caller - hàm này TỰ RAISE nếu lỗi (vd thiếu thư viện
     sentence-transformers, model chưa tải được); caller nên tự bọc try/except
     vì đây là bước bổ trợ, không nên làm hỏng luồng chính (tạo/sửa repair)."""
     with SessionLocal() as db:
-        repair = db.query(Repair).filter(Repair.id == repair_id).first()
+        repair = (
+            db.query(Repair)
+            .options(joinedload(Repair.created_by))
+            .filter(Repair.id == repair_id)
+            .first()
+        )
         if not repair:
             return
 
         text = _build_repair_text(repair)
         if not text.strip():
-            # Không còn field mô tả lỗi nào -> xoá embedding cũ (nếu có) để
+            # Không còn field nào để embed -> xoá embedding cũ (nếu có) để
             # không giữ lại vector đã lỗi thời.
             db.query(RepairEmbedding).filter(RepairEmbedding.repair_id == repair_id).delete()
             db.commit()
@@ -105,12 +111,11 @@ def reindex_all(progress_callback: Optional[Callable[[int, int], None]] = None) 
     return len(repair_ids)
 
 
-def search_similar(query_text: str, top_k: int = 10) -> List[Tuple[Repair, float]]:
-    """Tìm top_k repair có mô tả lỗi GẦN NGHĨA nhất với query_text. Trả về
+def search_similar(query_text: str, top_k: int = 30) -> List[Tuple[Repair, float]]:
+    """Tìm top_k repair có nội dung GẦN NGHĨA nhất với query_text. Trả về
     list rỗng nếu chưa có repair nào được index, hoặc nếu model embedding
     local lỗi (vd chưa cài sentence-transformers, chưa tải được model) -
-    KHÔNG raise, vì đây là bước bổ sung cho /ask, lỗi ở đây không nên làm
-    hỏng cả câu trả lời (nl_query_service vẫn có kết quả SQL)."""
+    KHÔNG raise, để nl_query_service báo lỗi rõ ràng cho Admin thay vì crash."""
     query_text = (query_text or "").strip()
     if not query_text:
         return []
@@ -122,7 +127,11 @@ def search_similar(query_text: str, top_k: int = 10) -> List[Tuple[Repair, float
         return []
 
     with SessionLocal() as db:
-        rows = db.query(RepairEmbedding).options(joinedload(RepairEmbedding.repair)).all()
+        rows = (
+            db.query(RepairEmbedding)
+            .options(joinedload(RepairEmbedding.repair).joinedload(Repair.created_by))
+            .all()
+        )
         scored = [
             (row.repair, _cosine_similarity(query_vector, row.embedding))
             for row in rows if row.repair is not None

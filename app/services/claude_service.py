@@ -4,7 +4,8 @@ from app.core.config import OPENROUTER_API_KEY
 
 """
 Service kết nối tới OpenRouter (https://openrouter.ai) - dùng chung cho các
-tính năng AI trong bot (vd /ask sinh SQL từ câu hỏi tự nhiên).
+tính năng AI trong bot (vd /ask tổng hợp câu trả lời từ dữ liệu RAG tìm
+được, xem app/services/nl_query_service.py).
 
 OpenRouter là 1 API GATEWAY duy nhất cho nhiều nhà cung cấp model (Anthropic,
 OpenAI, Google, ...), dùng chung 1 format request kiểu OpenAI Chat Completions
@@ -24,9 +25,9 @@ Model:
     Mặc định dùng Claude Sonnet - đổi DEFAULT_MODEL nếu muốn model khác.
 
 Class này CHỈ lo việc gọi API (build request, gửi, nhận text response).
-Logic nghiệp vụ (sinh SQL từ câu hỏi, validate câu SQL, format kết quả...)
-nằm ở service khác gọi vào đây - tách riêng để tái dùng được cho nhiều tính
-năng AI khác nhau, không chỉ riêng /ask.
+Logic nghiệp vụ (retrieval bằng RAG, build prompt, format kết quả...) nằm ở
+service khác gọi vào đây - tách riêng để tái dùng được cho nhiều tính năng
+AI khác nhau, không chỉ riêng /ask.
 """
 import os
 from typing import Optional
