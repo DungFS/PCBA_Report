@@ -16,7 +16,8 @@ ADMIN_COMMANDS = DEFAULT_COMMANDS + [
     BotCommand("board", "Quản lý board (list/add/edit/delete)"),
     BotCommand("contractor","Quản lý nha thau"),
     BotCommand("repair_detail_report", "Báo cáo chi tiết Repair"),
-    BotCommand("report_daily", "Báo cáo hang ngay")
+    BotCommand("report_daily", "Báo cáo hang ngay"),
+    BotCommand("ask", "Hỏi đáp AI về dữ liệu hệ thống")
     # import_repair đã chuyển sang chạy qua terminal (./run_import.sh),
     # không còn là command trên Telegram nữa.
 ]

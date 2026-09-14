@@ -11,6 +11,7 @@ from app.bot.commands.contractor_report_command import ContractorReportCommand
 from app.bot.commands.user_report_command import UserReportCommand
 from app.bot.commands.repair_detail_report_command import RepairDetailReportCommand
 from app.bot.commands.report_daily_command import ReportDailyCommand
+from app.bot.commands.ask_command import AskCommand
 
 def register_handlers(bot):
     # Khởi tạo và đăng ký từng class lệnh độc lập
@@ -27,7 +28,8 @@ def register_handlers(bot):
     UserReportCommand(bot).register()
     RepairDetailReportCommand(bot).register()
     ReportDailyCommand(bot).register()
-    
+    AskCommand(bot).register()
+
     # (Tùy chọn) Bắt tin nhắn rác hoặc echo chung ở cuối cùng nếu muốn
     @bot.message_handler(func=lambda message: True)
     def fallback_echo(message):
