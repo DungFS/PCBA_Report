@@ -846,11 +846,24 @@ class RepairCommand(BaseCommand):
         markup = InlineKeyboardMarkup(row_width=1)
         for c in contractors:
             markup.add(InlineKeyboardButton(c.name, callback_data=f"{CB_PREFIX}:addcontractor:{c.id}"))
+        markup.add(InlineKeyboardButton("🚫 Không có trong danh sách / Bỏ trống", callback_data=f"{CB_PREFIX}:addcontractor:skip"))
         markup.add(InlineKeyboardButton("❎ Hủy", callback_data=f"{CB_PREFIX}:cancel"))
 
-        self.bot.send_message(chat_id, "Chọn nhà thầu thực hiện sửa chữa:", reply_markup=markup)
+        self.bot.send_message(
+            chat_id,
+            "Chọn nhà thầu thực hiện sửa chữa:\n"
+            "(Nếu không thấy tên nhà thầu cần chọn, bấm '🚫 Bỏ trống' - có thể dùng /contractor add để thêm mới, rồi cập nhật lại record sau qua /repair update)",
+            reply_markup=markup
+        )
 
-    def _handle_add_contractor_selected(self, chat_id, contractor_id):
+    def _handle_add_contractor_selected(self, chat_id, value):
+        if value == "skip":
+            self._add_sessions[chat_id]["contractor_id"] = None
+            self.bot.send_message(chat_id, "✅ Đã bỏ trống nhà thầu (có thể cập nhật sau qua /repair update).")
+            self._ask_before_test_photos(chat_id)
+            return
+
+        contractor_id = int(value)
         with SessionLocal() as db:
             contractor = db.query(Contractor).filter(Contractor.id == contractor_id).first()
             if not contractor:
@@ -932,7 +945,10 @@ class RepairCommand(BaseCommand):
         )
 
     def _ask_ticket_id(self, chat_id):
-        msg = self.bot.send_message(chat_id, "Nhập ticket ID:\nGõ /cancel để hủy.")
+        msg = self.bot.send_message(
+            chat_id,
+            "Nhập ticket ID:\nGõ '-' nếu không có ticket, hoặc /cancel để hủy."
+        )
         self.bot.register_next_step_handler(msg, self._guarded(self._process_add_ticket_id))
 
     def _handle_add_station_status_selected(self, chat_id, value):
@@ -977,11 +993,29 @@ class RepairCommand(BaseCommand):
             self._cancel_add(chat_id)
             return
 
-        ticket_id = (message.text or "").strip()
-        if not ticket_id:
-            self.bot.reply_to(message, "❌ ticket ID không được để trống.")
+        raw = (message.text or "").strip()
+
+        if raw == "-":
+        # Bỏ qua ticket ID -> không gọi API tra cứu, nhập tay các field còn lại
+            self._add_sessions[chat_id]["ticket_id"] = None
+            self._add_sessions[chat_id]["_ticket_source"] = "skipped"
+            msg = self.bot.reply_to(
+                message,
+                "ℹ️ Đã bỏ qua ticket ID.\n\n"
+                "Nhập SN (Serial Number):\nGõ '-' nếu không có, hoặc /cancel để hủy."
+            )
+            self.bot.register_next_step_handler(msg, self._guarded(self._process_add_manual_sn))
             return
 
+        if not raw:
+            msg = self.bot.reply_to(
+                message,
+                "❌ ticket ID không được để trống. Nhập ticket ID, hoặc '-' nếu không có:"
+            )
+            self.bot.register_next_step_handler(msg, self._guarded(self._process_add_ticket_id))
+            return
+
+        ticket_id = raw
         self._add_sessions[chat_id]["ticket_id"] = ticket_id
 
         ticket_info = get_ticket_info(ticket_id)
@@ -996,8 +1030,8 @@ class RepairCommand(BaseCommand):
             self._finalize_add(message)
             return
 
-        # API không trả về ticket (không tìm thấy / chưa implement) -> nhập tay
-        # đầy đủ các field lẽ ra lấy từ API.
+    # API không trả về ticket (không tìm thấy / chưa implement) -> nhập tay
+    # đầy đủ các field lẽ ra lấy từ API.
         self._add_sessions[chat_id]["_ticket_source"] = "manual"
         msg = self.bot.reply_to(
             message,
@@ -1346,7 +1380,7 @@ class RepairCommand(BaseCommand):
         elif action == "devicenew":
             self._handle_device_new_button(chat_id)
         elif action == "addcontractor":
-            self._handle_add_contractor_selected(chat_id, int(parts[2]))
+            self._handle_add_contractor_selected(chat_id, parts[2])
         elif action == "addtest":
             self._handle_add_test_selected(chat_id, parts[2])
         elif action == "addafter":
