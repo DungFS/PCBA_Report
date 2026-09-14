@@ -179,7 +179,7 @@ class RepairDetailReportCommand(BaseCommand):
         with SessionLocal() as db:
             repairs = (
                 db.query(Repair)
-                .filter(Repair.created_at >= period_start, Repair.created_at < period_end)
+                .filter(Repair.date_receive >= period_start, Repair.date_receive < period_end)
                 .all()
             )
             boards = db.query(Board).all()
