@@ -2,7 +2,8 @@
 """
 Lệnh /ask - CHỈ ADMIN được dùng. Cho phép hỏi đáp tự nhiên (tiếng Việt) về
 dữ liệu trong DB: đếm/liệt kê theo user, board, nhà thầu; tìm các lỗi có mô
-tả tương tự nhau; đề xuất cách sửa chữa dựa trên lịch sử đã sửa thành công...
+tả tương tự nhau (RAG - so khớp ngữ nghĩa, không chỉ khớp từ khoá); đề xuất
+cách sửa chữa dựa trên lịch sử đã sửa thành công...
 
 Cách dùng:
     /ask User A đã sửa được bao nhiêu board trong tháng này?
@@ -11,8 +12,10 @@ Cách dùng:
 
 Nếu gõ /ask không kèm câu hỏi, bot sẽ hỏi lại ở tin nhắn tiếp theo.
 
-Xử lý nghiệp vụ (sinh SQL, chạy SQL, tổng hợp câu trả lời) nằm ở
-app/services/nl_query_service.py - file này chỉ lo phần giao tiếp Telegram.
+Xử lý nghiệp vụ nằm ở:
+    - app/services/nl_query_service.py - sinh SQL, chạy SQL, tổng hợp câu trả lời.
+    - app/services/rag_service.py      - tìm lỗi tương tự theo ngữ nghĩa (RAG).
+File này chỉ lo phần giao tiếp Telegram.
 """
 from app.bot.base_command import BaseCommand
 from app.core.database import SessionLocal
@@ -82,7 +85,10 @@ class AskCommand(BaseCommand):
                 pass
 
         answer_text = result.answer_text.strip() or "(AI không trả về nội dung)"
-        header = f"🤖 KẾT QUẢ ({result.row_count} dòng dữ liệu liên quan):\n\n"
+        header = (
+            f"🤖 KẾT QUẢ ({result.row_count} dòng SQL, "
+            f"{result.similar_count} lỗi tương tự qua RAG):\n\n"
+        )
         for chunk in self._chunk_text(header + answer_text, MAX_MESSAGE_LEN):
             self._safe_send(message.chat.id, chunk)
 

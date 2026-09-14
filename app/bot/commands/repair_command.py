@@ -12,6 +12,7 @@ from app.models import TestResult
 from app.models.board import Board
 from app.models.contractor import Contractor
 from app.models.repairs import Repair
+from app.services.rag_service import reindex_repair
 from app.services.ticket_api import get_ticket_info
 
 CB_PREFIX = "repaircrud"
@@ -89,6 +90,18 @@ class RepairCommand(BaseCommand):
         """Giống _guarded nhưng dùng self.admin_only - áp dụng cho next-step
         handler thuộc flow SEARCH (yêu cầu quyền admin)."""
         return self.admin_only(fn)
+
+    @staticmethod
+    def _reindex_best_effort(repair_id):
+        """Cập nhật embedding (RAG, xem app/services/rag_service.py) cho
+        repair vừa tạo/sửa - để /ask tìm được lỗi tương tự theo ngữ nghĩa.
+        BEST-EFFORT: nuốt lỗi (vd thiếu VOYAGE_API_KEY, Voyage API tạm thời
+        down) - đây là bước bổ trợ, không được phép làm hỏng luồng tạo/sửa
+        repair chính, vốn là nghiệp vụ quan trọng hơn nhiều."""
+        try:
+            reindex_repair(repair_id)
+        except Exception as e:
+            print(f"[WARN] Reindex RAG thất bại cho repair #{repair_id}: {e}")
 
     def _dispatch(self, sub, chat_id, extra_args=()):
         if sub == "add":
@@ -655,6 +668,7 @@ class RepairCommand(BaseCommand):
                 self.bot.reply_to(message, f"❌ Cập nhật thất bại: {e}")
                 return
 
+        self._reindex_best_effort(repair_id)
         session.pop("_editing_field", None)
         self.bot.reply_to(message, "✅ Đã cập nhật.")
         self._show_update_field_menu(chat_id)
@@ -698,6 +712,7 @@ class RepairCommand(BaseCommand):
                 self.bot.send_message(chat_id, f"❌ Cập nhật thất bại: {e}")
                 return
 
+        self._reindex_best_effort(repair_id)
         self.bot.send_message(chat_id, "✅ Đã cập nhật.")
         self._show_update_field_menu(chat_id)
 
@@ -1193,6 +1208,7 @@ class RepairCommand(BaseCommand):
                 self.bot.reply_to(message, f"❌ Tạo record thất bại: {e}")
                 return
 
+        self._reindex_best_effort(repair_id)
         self._add_sessions.pop(chat_id, None)
 
         summary_lines = [

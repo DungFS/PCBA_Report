@@ -23,9 +23,11 @@ from sqlalchemy import text
 
 from app.core.database import Base, SessionLocal
 from app.services.claude_service import get_claude_service
+from app.services.rag_service import search_similar
 
 MAX_ROWS = 200          # số dòng tối đa lấy về từ DB
 MAX_ROWS_FOR_AI = 40    # số dòng tối đa đưa vào prompt bước 2 (tránh phình prompt)
+RAG_TOP_K = 10          # số repair "gần nghĩa nhất" (RAG) đưa vào prompt bước 2
 
 # Các từ khoá không được phép xuất hiện trong câu SQL do AI sinh ra - chỉ cho
 # phép đọc dữ liệu (SELECT), không cho phép bất kỳ thao tác ghi/thay đổi nào.
@@ -53,11 +55,18 @@ class AskResult:
     row_count: int
     rows_preview: List[Tuple[Any, ...]] = field(default_factory=list)
     answer_text: str = ""
+    similar_count: int = 0  # số repair tìm được qua RAG (semantic search)
 
 
 def answer_question(question: str) -> AskResult:
     """Hàm chính - gọi từ bot command. Ném NLQueryError nếu SQL AI sinh ra
-    không an toàn/không hợp lệ; ném Exception khác nếu lỗi kết nối AI/DB."""
+    không an toàn/không hợp lệ; ném Exception khác nếu lỗi kết nối AI/DB.
+
+    Kết hợp 2 nguồn retrieval trước khi tổng hợp câu trả lời:
+        1) SQL do AI sinh ra - chính xác cho đếm/liệt kê/lọc điều kiện rõ.
+        2) RAG (vector similarity, xem rag_service.py) - bắt lỗi tương tự dù
+           diễn đạt khác từ. Lỗi ở bước này KHÔNG làm hỏng cả câu trả lời
+           (search_similar tự nuốt lỗi, trả về rỗng)."""
     question = (question or "").strip()
     if not question:
         raise NLQueryError("Câu hỏi trống.")
@@ -70,9 +79,10 @@ def answer_question(question: str) -> AskResult:
     sql = _ensure_limit(sql, MAX_ROWS)
 
     columns, rows = _run_readonly_query(sql)
+    similar = search_similar(question, top_k=RAG_TOP_K)
 
     answer_text = claude.ask(
-        prompt=_build_answer_prompt(question, columns, rows),
+        prompt=_build_answer_prompt(question, columns, rows, similar),
         system=_ANSWER_SYSTEM_PROMPT,
         max_tokens=900,
         temperature=0.3,
@@ -84,6 +94,7 @@ def answer_question(question: str) -> AskResult:
         row_count=len(rows),
         rows_preview=rows[:MAX_ROWS_FOR_AI],
         answer_text=answer_text,
+        similar_count=len(similar),
     )
 
 
@@ -195,24 +206,38 @@ def _run_readonly_query(sql: str) -> Tuple[List[str], List[Tuple[Any, ...]]]:
 
 _ANSWER_SYSTEM_PROMPT = (
     "Bạn là trợ lý phân tích dữ liệu cho hệ thống quản lý sửa chữa board PCBA. "
-    "Bạn sẽ nhận được câu hỏi gốc của Admin và dữ liệu thật lấy từ database "
-    "(dạng bảng). Hãy trả lời NGẮN GỌN, RÕ RÀNG bằng tiếng Việt, dựa HOÀN TOÀN "
-    "vào dữ liệu được cung cấp - KHÔNG bịa thêm thông tin không có trong dữ liệu.\n"
-    "- Nếu dữ liệu rỗng: nói rõ không tìm thấy dữ liệu phù hợp.\n"
-    "- Nếu câu hỏi yêu cầu đếm/liệt kê: trả lời số liệu cụ thể, có thể liệt kê "
-    "gọn bằng gạch đầu dòng.\n"
-    "- Nếu câu hỏi yêu cầu tìm lỗi tương tự nhau: chỉ ra các bản ghi có "
-    "failure_cause/original_phenomenon giống hoặc gần giống nhau trong dữ liệu.\n"
-    "- Nếu câu hỏi yêu cầu đề xuất cách sửa chữa: dựa vào cột `disposition` "
-    "của các bản ghi có lỗi tương tự ĐÃ CÓ trong dữ liệu (đặc biệt các bản ghi "
-    "có after_repair_result = PASS) để đề xuất, nêu rõ đây là dựa theo lịch sử "
+    "Bạn sẽ nhận được câu hỏi gốc của Admin và dữ liệu thật lấy từ database, "
+    "chia làm 2 nguồn:\n"
+    "  [1] Dữ liệu truy vấn SQL trực tiếp - chính xác cho đếm/liệt kê/lọc theo "
+    "điều kiện rõ ràng (vd 'user A sửa được bao nhiêu board').\n"
+    "  [2] Dữ liệu tìm bằng RAG (vector similarity - so khớp NGỮ NGHĨA, không "
+    "phải khớp từ khoá) - các repair có mô tả lỗi gần nghĩa nhất với câu hỏi, "
+    "hữu ích cho câu hỏi kiểu 'tìm lỗi tương tự'/'đề xuất cách sửa', có thể "
+    "KHÔNG liên quan nếu câu hỏi là dạng đếm/liệt kê đơn giản - hãy tự đánh "
+    "giá độ liên quan của [2] trước khi dùng, đừng ép dùng nếu không hợp.\n"
+    "Hãy trả lời NGẮN GỌN, RÕ RÀNG bằng tiếng Việt, dựa HOÀN TOÀN vào dữ liệu "
+    "được cung cấp ở [1] và [2] - KHÔNG bịa thêm thông tin không có trong dữ liệu.\n"
+    "- Nếu cả 2 nguồn đều rỗng/không liên quan: nói rõ không tìm thấy dữ liệu phù hợp.\n"
+    "- Nếu câu hỏi yêu cầu đếm/liệt kê: ưu tiên dùng [1], trả lời số liệu cụ "
+    "thể, có thể liệt kê gọn bằng gạch đầu dòng.\n"
+    "- Nếu câu hỏi yêu cầu tìm lỗi tương tự nhau: ưu tiên dùng [2] (đã được "
+    "xếp hạng theo độ giống ngữ nghĩa), có thể bổ sung thêm bằng [1] nếu [1] "
+    "cũng có bản ghi liên quan.\n"
+    "- Nếu câu hỏi yêu cầu đề xuất cách sửa chữa: dựa vào cột disposition của "
+    "các bản ghi có lỗi tương tự ĐÃ CÓ ở [2] (đặc biệt các bản ghi có "
+    "after_repair_result = PASS) để đề xuất, nêu rõ đây là dựa theo lịch sử "
     "đã từng sửa, không phải suy đoán ngoài dữ liệu.\n"
     "- Nếu dữ liệu bị cắt bớt (ghi rõ trong phần dữ liệu), hãy nói rõ kết luận "
     "dựa trên phần dữ liệu xem được, không khẳng định tuyệt đối cho toàn bộ hệ thống."
 )
 
 
-def _build_answer_prompt(question: str, columns: List[str], rows: List[Tuple[Any, ...]]) -> str:
+def _build_answer_prompt(
+    question: str,
+    columns: List[str],
+    rows: List[Tuple[Any, ...]],
+    similar: List[Tuple[Any, float]],
+) -> str:
     total = len(rows)
     preview = rows[:MAX_ROWS_FOR_AI]
     table_text = _rows_to_table_text(columns, preview)
@@ -220,9 +245,27 @@ def _build_answer_prompt(question: str, columns: List[str], rows: List[Tuple[Any
         f"\n(Dữ liệu có tổng cộng {total} dòng, chỉ hiển thị {len(preview)} dòng đầu ở trên.)"
         if total > len(preview) else ""
     )
+    sql_section = f"[1] Dữ liệu truy vấn SQL trực tiếp từ database ({total} dòng):\n{table_text}{truncated_note}"
+
+    if similar:
+        rag_lines = [_format_similar_repair(repair, score) for repair, score in similar]
+        rag_section = (
+            "\n\n[2] Các repair có mô tả lỗi GẦN NGHĨA nhất với câu hỏi (RAG, đã "
+            "xếp hạng theo độ giống, cao -> thấp):\n" + "\n".join(rag_lines)
+        )
+    else:
+        rag_section = "\n\n[2] (không có dữ liệu - chưa có repair nào được index cho RAG, hoặc RAG tạm thời lỗi)"
+
+    return f"Câu hỏi của Admin: {question}\n\n{sql_section}{rag_section}"
+
+
+def _format_similar_repair(repair, score: float) -> str:
+    after = repair.after_repair_result.value if repair.after_repair_result else "-"
     return (
-        f"Câu hỏi của Admin: {question}\n\n"
-        f"Dữ liệu truy vấn được từ database ({total} dòng):\n{table_text}{truncated_note}"
+        f"- [độ giống {score:.2f}] Repair #{repair.id} (board {repair.board_code or '-'}, "
+        f"code {repair.code or '-'}): hiện tượng=\"{repair.original_phenomenon or '-'}\", "
+        f"nguyên nhân=\"{repair.failure_cause or '-'}\", cách sửa=\"{repair.disposition or '-'}\", "
+        f"kết quả sau sửa={after}"
     )
 
 
