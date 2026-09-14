@@ -28,6 +28,17 @@ from typing import Callable, List, Optional, Tuple
 from sqlalchemy.orm import joinedload
 
 from app.core.database import SessionLocal
+# Board/Contractor không được dùng trực tiếp trong file này, nhưng BẮT BUỘC
+# phải import ở đây: Repair khai báo relationship("Board", ...)/("Contractor",
+# ...) bằng TÊN CLASS (string) - SQLAlchemy chỉ resolve được tên đó nếu class
+# tương ứng đã được import (đăng ký vào registry) từ trước. Trong bot chính,
+# router.py tình cờ import Board/Contractor trước khi dùng tới Repair nên
+# không lỗi; nhưng 1 script chạy riêng chỉ import rag_service (vd
+# scripts/build_repair_embeddings.py) sẽ thiếu, gây lỗi
+# "NoReferencedTableError: ... could not find table 'boards'/'contractors'"
+# ngay khi query Repair lần đầu. Import ở đây để mọi entrypoint đều an toàn.
+from app.models.board import Board  # noqa: F401
+from app.models.contractor import Contractor  # noqa: F401
 from app.models.repairs import Repair
 from app.models.repair_embedding import RepairEmbedding
 from app.services.embedding_service import get_embedding_service
