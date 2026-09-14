@@ -95,9 +95,9 @@ class RepairCommand(BaseCommand):
     def _reindex_best_effort(repair_id):
         """Cập nhật embedding (RAG, xem app/services/rag_service.py) cho
         repair vừa tạo/sửa - để /ask tìm được lỗi tương tự theo ngữ nghĩa.
-        BEST-EFFORT: nuốt lỗi (vd thiếu VOYAGE_API_KEY, Voyage API tạm thời
-        down) - đây là bước bổ trợ, không được phép làm hỏng luồng tạo/sửa
-        repair chính, vốn là nghiệp vụ quan trọng hơn nhiều."""
+        BEST-EFFORT: nuốt lỗi (vd chưa cài sentence-transformers, model
+        chưa tải được) - đây là bước bổ trợ, không được phép làm hỏng luồng
+        tạo/sửa repair chính, vốn là nghiệp vụ quan trọng hơn nhiều."""
         try:
             reindex_repair(repair_id)
         except Exception as e:

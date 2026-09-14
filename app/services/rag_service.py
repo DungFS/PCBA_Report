@@ -2,7 +2,7 @@
 """
 RAG (Retrieval-Augmented Generation) cho tính năng /ask - tìm các repair có
 mô tả lỗi TƯƠNG TỰ NHAU theo NGỮ NGHĨA (không chỉ khớp từ khoá như LIKE
-trong nl_query_service.py), dùng vector embedding từ Voyage AI (xem
+trong nl_query_service.py), dùng vector embedding sinh LOCAL (xem
 app/services/embedding_service.py).
 
 Khác biệt với nl_query_service.py:
@@ -49,9 +49,9 @@ def _build_repair_text(repair: Repair) -> str:
 def reindex_repair(repair_id: int) -> None:
     """Tạo/cập nhật embedding cho 1 repair. Gọi mỗi khi repair được tạo mới
     hoặc sửa field mô tả lỗi (xem hook trong repair_command.py). Best-effort
-    theo thiết kế của caller - hàm này TỰ RAISE nếu lỗi (vd thiếu
-    VOYAGE_API_KEY, API down); caller nên tự bọc try/except vì đây là bước
-    bổ trợ, không nên làm hỏng luồng chính (tạo/sửa repair)."""
+    theo thiết kế của caller - hàm này TỰ RAISE nếu lỗi (vd thiếu thư viện
+    sentence-transformers, model chưa tải được); caller nên tự bọc try/except
+    vì đây là bước bổ trợ, không nên làm hỏng luồng chính (tạo/sửa repair)."""
     with SessionLocal() as db:
         repair = db.query(Repair).filter(Repair.id == repair_id).first()
         if not repair:
@@ -96,9 +96,10 @@ def reindex_all(progress_callback: Optional[Callable[[int, int], None]] = None) 
 
 def search_similar(query_text: str, top_k: int = 10) -> List[Tuple[Repair, float]]:
     """Tìm top_k repair có mô tả lỗi GẦN NGHĨA nhất với query_text. Trả về
-    list rỗng nếu chưa có repair nào được index, hoặc nếu Voyage API lỗi/
-    thiếu key - KHÔNG raise, vì đây là bước bổ sung cho /ask, lỗi ở đây
-    không nên làm hỏng cả câu trả lời (nl_query_service vẫn có kết quả SQL)."""
+    list rỗng nếu chưa có repair nào được index, hoặc nếu model embedding
+    local lỗi (vd chưa cài sentence-transformers, chưa tải được model) -
+    KHÔNG raise, vì đây là bước bổ sung cho /ask, lỗi ở đây không nên làm
+    hỏng cả câu trả lời (nl_query_service vẫn có kết quả SQL)."""
     query_text = (query_text or "").strip()
     if not query_text:
         return []
