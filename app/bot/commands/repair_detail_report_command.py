@@ -15,6 +15,7 @@ from PIL import Image as PILImage
 
 from app.bot.base_command import BaseCommand
 from app.core.database import SessionLocal
+from app.models import TestResult
 from app.models.board import Board
 from app.models.contractor import Contractor
 from app.models.repairs import Repair
@@ -31,7 +32,7 @@ MONTH_NAMES_VI = [
     "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12",
 ]
 
-COLUMNS = [
+DETAIL_COLUMNS = [
     "ID", "Date Receive", "Board ID (gốc)", "Board Code", "Board Name",
     "Device Code", "Contractor", "Test Tool Result", "Failure Cause",
     "Disposition", "After Repair Result", "Charging Station Test Status",
@@ -41,6 +42,12 @@ COLUMNS = [
     "Before Test Photo 1", "Before Test Photo 2",
     "After Repair Photo 1", "After Repair Photo 2", "After Repair Photo 3",
     "Created By", "Created At", "Updated By", "Updated At",
+]
+
+SUMMARY_COLUMNS = [
+    "Material Code", "TYPE", "Quality",
+    "First Test PASS rate", "After repair Test PASS rate",
+    "Analytics", "Discard",
 ]
 
 
@@ -63,7 +70,7 @@ class RepairDetailReportCommand(BaseCommand):
 
     def _route_callback(self, call):
         chat_id = call.message.chat.id
-        parts = call.data.split(":")
+        parts = call.data.split(":")  # ["repairdetailreport", "<action>", ...]
         action = parts[1] if len(parts) > 1 else None
 
         if action == "month":
@@ -149,6 +156,8 @@ class RepairDetailReportCommand(BaseCommand):
 
     @staticmethod
     def _week_chunks(year, month):
+        """Chia tháng thành các tuần 7 ngày cố định (1-7, 8-14, 15-21, 22-28,
+        29-cuối tháng) - luôn khớp trọn trong 1 tháng, không tràn sang tháng khác."""
         total_days = calendar.monthrange(year, month)[1]
         chunks = []
         day = 1
@@ -179,6 +188,18 @@ class RepairDetailReportCommand(BaseCommand):
         ).start()
 
     def _build_and_send_report(self, chat_id, period_start, period_end, label):
+        """
+        Lọc theo created_at nằm trong [period_start, period_end) - vì đây là
+        thời điểm record thực sự được tạo trong hệ thống (luôn có sẵn nhờ
+        AuditMixin), đáng tin cậy hơn date_receive (thường bị thiếu ở data cũ).
+
+        Sắp xếp kết quả theo date_receive GẦN NHẤT trước (giảm dần); record
+        thiếu date_receive được xếp xuống cuối.
+
+        Kết quả xuất ra 1 file xlsx nhiều sheet:
+        - Sheet đầu "Tổng hợp": group theo board, đếm Quality / PASS rate / Discard.
+        - Các sheet sau: 1 sheet / board, liệt kê chi tiết từng repair (kèm ảnh).
+        """
         try:
             with SessionLocal() as db:
                 repairs = (
@@ -200,14 +221,21 @@ class RepairDetailReportCommand(BaseCommand):
             contractor_names = {c.id: c.name for c in contractors}
             user_names = {u.id: (getattr(u, "full_name", None) or f"User #{u.id}") for u in users}
 
-            rows = [self._build_row(r, board_names, contractor_names, user_names) for r in repairs]
+            # Group theo Board Code - mỗi board 1 sheet chi tiết
+            groups: dict[str, list[Repair]] = {}
+            for r in repairs:
+                key = r.board_code or "__unknown__"
+                groups.setdefault(key, []).append(r)
 
-            file_path = self._build_xlsx(rows)
+            file_path = self._build_workbook(groups, board_names, contractor_names, user_names)
             try:
                 with open(file_path, "rb") as f:
                     self.bot.send_document(
                         chat_id, f,
-                        caption=f"📊 Báo cáo chi tiết Repair - {label} ({len(rows)} bản ghi, sắp xếp theo ngày gần nhất)"
+                        caption=(
+                            f"📊 Báo cáo chi tiết Repair - {label} "
+                            f"({len(repairs)} bản ghi, {len(groups)} board, sắp xếp theo ngày gần nhất)"
+                        )
                     )
             finally:
                 try:
@@ -219,6 +247,43 @@ class RepairDetailReportCommand(BaseCommand):
                 self.bot.send_message(chat_id, f"❌ Có lỗi khi tạo báo cáo \"{label}\": {e}")
             except Exception:
                 pass
+
+    # ------------------------------------------------------------------
+    # Phân loại PASS / FAIL / Discard cho sheet Tổng hợp - so theo enum
+    # TestResult (PASS / FAIL / DISCARD), không đoán chuỗi.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_pass(v) -> bool:
+        return v == TestResult.PASS
+
+    @staticmethod
+    def _is_fail(v) -> bool:
+        return v == TestResult.FAIL
+
+    @staticmethod
+    def _is_discard(v) -> bool:
+        return v == TestResult.DISCARD
+
+    @classmethod
+    def _compute_summary_counts(cls, group_repairs):
+        """
+        Quality = tổng số repair của board.
+        First Test PASS rate = số lượng test_tool_result == PASS.
+        After repair Test PASS rate = số lượng after_repair_result == PASS.
+        Phân tích = số lượng after_repair_result == FAIL.
+        Discard = số lượng test_tool_result == DISCARD.
+        """
+        quality = len(group_repairs)
+        first_pass = sum(1 for r in group_repairs if cls._is_pass(r.test_tool_result))
+        after_pass = sum(1 for r in group_repairs if cls._is_pass(r.after_repair_result))
+        analytics = sum(1 for r in group_repairs if cls._is_fail(r.after_repair_result))
+        discard = sum(1 for r in group_repairs if cls._is_discard(r.test_tool_result))
+        return quality, first_pass, after_pass, analytics, discard
+
+    # ------------------------------------------------------------------
+    # Build dòng chi tiết
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _build_row(r, board_names, contractor_names, user_names):
@@ -259,7 +324,7 @@ class RepairDetailReportCommand(BaseCommand):
         ]
 
     # ------------------------------------------------------------------
-    # Xử lý ảnh: resize + nén trước khi nhúng vào Excel
+    # Ảnh: resize + nén trước khi nhúng, tránh file xlsx quá nặng
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -278,20 +343,101 @@ class RepairDetailReportCommand(BaseCommand):
             return None
 
     @staticmethod
-    def _build_xlsx(rows) -> Path:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Repair Detail Report"
+    def _safe_sheet_name(name: str, used_names: set) -> str:
+        """Excel giới hạn tên sheet <= 31 ký tự, không chứa []:*?/\\, và
+        không được trùng nhau trong cùng workbook."""
+        invalid = set('[]:*?/\\')
+        cleaned = "".join(c for c in (name or "Unknown") if c not in invalid).strip() or "Unknown"
+        cleaned = cleaned[:31]
+        base, i = cleaned, 2
+        while cleaned in used_names:
+            suffix = f" ({i})"
+            cleaned = base[: 31 - len(suffix)] + suffix
+            i += 1
+        used_names.add(cleaned)
+        return cleaned
 
+    # ------------------------------------------------------------------
+    # Build workbook: sheet 1 = Tổng hợp, các sheet sau = 1 sheet / board
+    # ------------------------------------------------------------------
+
+    def _build_workbook(self, groups, board_names, contractor_names, user_names) -> Path:
+        wb = Workbook()
+        used_sheet_names = {"Tổng hợp"}
+
+        # Sắp xếp board theo tên hiển thị cho dễ nhìn
+        ordered_codes = sorted(
+            groups.keys(),
+            key=lambda code: board_names.get(code, code) or ""
+        )
+
+        # ---------------- Sheet Tổng hợp ----------------
+        ws_summary = wb.active
+        ws_summary.title = "Tổng hợp"
+        self._write_summary_sheet(ws_summary, ordered_codes, groups, board_names)
+
+        # ---------------- Các sheet chi tiết theo board ----------------
+        for code in ordered_codes:
+            group_repairs = groups[code]
+            board_display_name = board_names.get(code, code) if code != "__unknown__" else "Không xác định"
+            sheet_title = self._safe_sheet_name(board_display_name or code, used_sheet_names)
+            ws = wb.create_sheet(title=sheet_title)
+            detail_rows = [
+                self._build_row(r, board_names, contractor_names, user_names)
+                for r in group_repairs
+            ]
+            self._write_detail_sheet(ws, detail_rows)
+
+        dir_path = Path(REPORT_TMP_DIR)
+        dir_path.mkdir(parents=True, exist_ok=True)
+        file_path = dir_path / f"repair_detail_report_{uuid.uuid4().hex[:8]}.xlsx"
+        wb.save(file_path)
+        return file_path
+
+    @classmethod
+    def _write_summary_sheet(cls, ws, ordered_codes, groups, board_names):
         header_font = Font(name="Arial", bold=True, size=11, color="FFFFFF")
         header_fill = PatternFill("solid", fgColor="4472C4")
         normal_font = Font(name="Arial", size=10)
         center = Alignment(horizontal="center", vertical="center")
         left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-        image_col_indices = {i for i, h in enumerate(COLUMNS, start=1) if "Photo" in h}
+        for col_idx, h in enumerate(SUMMARY_COLUMNS, start=1):
+            cell = ws.cell(row=1, column=col_idx, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = center
+            ws.column_dimensions[get_column_letter(col_idx)].width = 22 if col_idx != 2 else 32
 
-        for col_idx, h in enumerate(COLUMNS, start=1):
+        row_idx = 2
+        for code in ordered_codes:
+            group_repairs = groups[code]
+            material_code = None if code == "__unknown__" else code
+            board_type = board_names.get(code, code) if code != "__unknown__" else "Không xác định"
+            quality, first_pass, after_pass, analytics, discard = cls._compute_summary_counts(group_repairs)
+
+            values = [material_code, board_type, quality, first_pass, after_pass, analytics, discard]
+            for col_idx, value in enumerate(values, start=1):
+                cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                cell.font = normal_font
+                cell.alignment = left if col_idx in (1, 2) else center
+            row_idx += 1
+
+        ws.freeze_panes = "A2"
+
+    @staticmethod
+    def _write_detail_sheet(ws, rows):
+        header_font = Font(name="Arial", bold=True, size=11, color="FFFFFF")
+        header_fill = PatternFill("solid", fgColor="4472C4")
+        normal_font = Font(name="Arial", size=10)
+        center = Alignment(horizontal="center", vertical="center")
+        left = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+        # Nhận diện các cột chứa hình ảnh (có chữ "Photo" trong tiêu đề)
+        image_col_indices = {i for i, h in enumerate(DETAIL_COLUMNS, start=1) if "Photo" in h}
+
+        # Format header
+        for col_idx, h in enumerate(DETAIL_COLUMNS, start=1):
             cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
             cell.fill = header_fill
@@ -304,10 +450,12 @@ class RepairDetailReportCommand(BaseCommand):
 
         ws.column_dimensions[get_column_letter(1)].width = 8  # ID
 
+        # Ghi dữ liệu từng dòng
         for row_idx, row_values in enumerate(rows, start=2):
             ws.row_dimensions[row_idx].height = 80
 
             for col_idx, value in enumerate(row_values, start=1):
+                # Xử lý nếu đây là cột ảnh và có dữ liệu đường dẫn
                 if col_idx in image_col_indices and value:
                     img_path = Path(value)
                     if img_path.is_file():
@@ -319,19 +467,13 @@ class RepairDetailReportCommand(BaseCommand):
                                 img.height = 100
                                 cell_address = f"{get_column_letter(col_idx)}{row_idx}"
                                 ws.add_image(img, cell_address)
-                                continue
+                                continue  # Bỏ qua việc ghi text đường dẫn
                             except Exception:
                                 pass  # fallback xuống ghi text nếu vẫn lỗi
 
+                # Ghi text bình thường (cho các cột không phải ảnh hoặc ảnh bị lỗi/thiếu)
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)
                 cell.font = normal_font
                 cell.alignment = center if col_idx in (1, 7, 8, 11) else left
 
         ws.freeze_panes = "A2"
-
-        dir_path = Path(REPORT_TMP_DIR)
-        dir_path.mkdir(parents=True, exist_ok=True)
-        file_path = dir_path / f"repair_detail_report_{uuid.uuid4().hex[:8]}.xlsx"
-        wb.save(file_path)
-
-        return file_path
