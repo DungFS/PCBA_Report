@@ -1,13 +1,17 @@
 # app/bot/commands/repair_detail_report_command.py
 import calendar
+import threading
 import uuid
 from datetime import date, datetime, timedelta
+from io import BytesIO
 from pathlib import Path
 
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 from openpyxl import Workbook
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
+from openpyxl.drawing.image import Image as ExcelImage
+from PIL import Image as PILImage
 
 from app.bot.base_command import BaseCommand
 from app.core.database import SessionLocal
@@ -15,20 +19,18 @@ from app.models.board import Board
 from app.models.contractor import Contractor
 from app.models.repairs import Repair
 from app.models.user import User
-from openpyxl.drawing.image import Image as ExcelImage
 
 REPORT_TMP_DIR = "storage/tmp_reports"
 CB_PREFIX = "repairdetailreport"
 YEAR_PICKER_COUNT = 5
+THUMBNAIL_SIZE = (120, 120)   # kích thước ảnh sau khi resize (px)
+THUMBNAIL_QUALITY = 70        # chất lượng nén JPEG (0-95)
 
 MONTH_NAMES_VI = [
     "Tháng 1", "Tháng 2", "Tháng 3", "Tháng 4", "Tháng 5", "Tháng 6",
     "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12",
 ]
 
-# Header cột xlsx theo đúng thứ tự - khớp field_getter tương ứng bên dưới.
-# "Tất cả cột trong bảng repairs" + vài cột resolve tên (Board Name,
-# Contractor, Created By) cho dễ đọc thay vì chỉ toàn ID/code.
 COLUMNS = [
     "ID", "Date Receive", "Board ID (gốc)", "Board Code", "Board Name",
     "Device Code", "Contractor", "Test Tool Result", "Failure Cause",
@@ -61,7 +63,7 @@ class RepairDetailReportCommand(BaseCommand):
 
     def _route_callback(self, call):
         chat_id = call.message.chat.id
-        parts = call.data.split(":")  # ["repairdetailreport", "<action>", ...]
+        parts = call.data.split(":")
         action = parts[1] if len(parts) > 1 else None
 
         if action == "month":
@@ -147,8 +149,6 @@ class RepairDetailReportCommand(BaseCommand):
 
     @staticmethod
     def _week_chunks(year, month):
-        """Chia tháng thành các tuần 7 ngày cố định (1-7, 8-14, 15-21, 22-28,
-        29-cuối tháng) - luôn khớp trọn trong 1 tháng, không tràn sang tháng khác."""
         total_days = calendar.monthrange(year, month)[1]
         chunks = []
         day = 1
@@ -162,52 +162,61 @@ class RepairDetailReportCommand(BaseCommand):
         return chunks
 
     # ------------------------------------------------------------------
-    # Sinh báo cáo
+    # Sinh báo cáo - chạy nền để không chặn bot / không bị timeout
     # ------------------------------------------------------------------
 
     def _send_report(self, chat_id, period_start, period_end, label):
         """
-        Xuất TẤT CẢ cột trong bảng repairs ra file xlsx.
-
-        Lọc theo created_at nằm trong [period_start, period_end) - vì đây là
-        thời điểm record thực sự được tạo trong hệ thống (luôn có sẵn nhờ
-        AuditMixin), đáng tin cậy hơn date_receive (thường bị thiếu ở data cũ).
-
-        Sắp xếp kết quả theo date_receive GẦN NHẤT trước (giảm dần); record
-        thiếu date_receive được xếp xuống cuối.
+        Phản hồi ngay cho người dùng, giao toàn bộ việc nặng (query DB,
+        build ảnh, ghi xlsx) cho thread nền để tránh chặn handler và
+        tránh timeout phía Telegram/webhook.
         """
-        with SessionLocal() as db:
-            repairs = (
-                db.query(Repair)
-                .filter(Repair.date_receive >= period_start, Repair.date_receive < period_end)
-                .all()
-            )
-            boards = db.query(Board).all()
-            contractors = db.query(Contractor).all()
-            users = db.query(User).all()
+        self.bot.send_message(chat_id, f"⏳ Đang tạo báo cáo cho \"{label}\", vui lòng chờ...")
+        threading.Thread(
+            target=self._build_and_send_report,
+            args=(chat_id, period_start, period_end, label),
+            daemon=True,
+        ).start()
 
-        if not repairs:
-            self.bot.send_message(chat_id, f"📊 Không có repair nào trong khoảng \"{label}\".")
-            return
-
-        repairs.sort(key=lambda r: r.date_receive or date.min, reverse=True)
-
-        board_names = {b.code: (b.ten or b.code) for b in boards}
-        contractor_names = {c.id: c.name for c in contractors}
-        user_names = {u.id: (getattr(u, "full_name", None) or f"User #{u.id}") for u in users}
-
-        rows = [self._build_row(r, board_names, contractor_names, user_names) for r in repairs]
-
-        file_path = self._build_xlsx(rows)
+    def _build_and_send_report(self, chat_id, period_start, period_end, label):
         try:
-            with open(file_path, "rb") as f:
-                self.bot.send_document(
-                    chat_id, f,
-                    caption=f"📊 Báo cáo chi tiết Repair - {label} ({len(rows)} bản ghi, sắp xếp theo ngày gần nhất)"
+            with SessionLocal() as db:
+                repairs = (
+                    db.query(Repair)
+                    .filter(Repair.date_receive >= period_start, Repair.date_receive < period_end)
+                    .all()
                 )
-        finally:
+                boards = db.query(Board).all()
+                contractors = db.query(Contractor).all()
+                users = db.query(User).all()
+
+            if not repairs:
+                self.bot.send_message(chat_id, f"📊 Không có repair nào trong khoảng \"{label}\".")
+                return
+
+            repairs.sort(key=lambda r: r.date_receive or date.min, reverse=True)
+
+            board_names = {b.code: (b.ten or b.code) for b in boards}
+            contractor_names = {c.id: c.name for c in contractors}
+            user_names = {u.id: (getattr(u, "full_name", None) or f"User #{u.id}") for u in users}
+
+            rows = [self._build_row(r, board_names, contractor_names, user_names) for r in repairs]
+
+            file_path = self._build_xlsx(rows)
             try:
-                file_path.unlink()
+                with open(file_path, "rb") as f:
+                    self.bot.send_document(
+                        chat_id, f,
+                        caption=f"📊 Báo cáo chi tiết Repair - {label} ({len(rows)} bản ghi, sắp xếp theo ngày gần nhất)"
+                    )
+            finally:
+                try:
+                    file_path.unlink()
+                except Exception:
+                    pass
+        except Exception as e:
+            try:
+                self.bot.send_message(chat_id, f"❌ Có lỗi khi tạo báo cáo \"{label}\": {e}")
             except Exception:
                 pass
 
@@ -249,6 +258,25 @@ class RepairDetailReportCommand(BaseCommand):
             r.updated_at.strftime("%d/%m/%Y %H:%M") if r.updated_at else None,
         ]
 
+    # ------------------------------------------------------------------
+    # Xử lý ảnh: resize + nén trước khi nhúng vào Excel
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _make_thumbnail(img_path: Path) -> BytesIO | None:
+        """Resize + nén ảnh thành JPEG nhỏ gọn, trả về BytesIO để nhúng
+        thẳng vào Excel mà không cần ghi file tạm."""
+        try:
+            with PILImage.open(img_path) as im:
+                im = im.convert("RGB")
+                im.thumbnail(THUMBNAIL_SIZE)  # giữ tỉ lệ, không phóng to
+                buf = BytesIO()
+                im.save(buf, format="JPEG", quality=THUMBNAIL_QUALITY, optimize=True)
+                buf.seek(0)
+                return buf
+        except Exception:
+            return None
+
     @staticmethod
     def _build_xlsx(rows) -> Path:
         wb = Workbook()
@@ -261,17 +289,14 @@ class RepairDetailReportCommand(BaseCommand):
         center = Alignment(horizontal="center", vertical="center")
         left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-        # Nhận diện các cột chứa hình ảnh (có chữ "Photo" trong tiêu đề)
         image_col_indices = {i for i, h in enumerate(COLUMNS, start=1) if "Photo" in h}
 
-        # Format header
         for col_idx, h in enumerate(COLUMNS, start=1):
             cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = center
-            
-            # Chỉnh độ rộng cột. Cột ảnh cho rộng hơn một chút.
+
             if col_idx in image_col_indices:
                 ws.column_dimensions[get_column_letter(col_idx)].width = 25
             else:
@@ -279,31 +304,25 @@ class RepairDetailReportCommand(BaseCommand):
 
         ws.column_dimensions[get_column_letter(1)].width = 8  # ID
 
-        # Ghi dữ liệu từng dòng
         for row_idx, row_values in enumerate(rows, start=2):
-            # Tăng chiều cao của dòng để vừa với hình ảnh (ví dụ: 80 pixels)
-            ws.row_dimensions[row_idx].height = 80 
-            
+            ws.row_dimensions[row_idx].height = 80
+
             for col_idx, value in enumerate(row_values, start=1):
-                # Xử lý nếu đây là cột ảnh và có dữ liệu đường dẫn
                 if col_idx in image_col_indices and value:
                     img_path = Path(value)
-                    # Kiểm tra file ảnh có thực sự tồn tại trên disk không
                     if img_path.is_file():
-                        try:
-                            img = ExcelImage(str(img_path))
-                            # Resize ảnh cho vừa ô (100x100 px)
-                            img.width = 100
-                            img.height = 100
-                            
-                            # Tọa độ ô, ví dụ: "V2", "W2"
-                            cell_address = f"{get_column_letter(col_idx)}{row_idx}"
-                            ws.add_image(img, cell_address)
-                            continue  # Bỏ qua việc ghi text đường dẫn
-                        except Exception:
-                            pass # Nếu lỗi file (không phải ảnh hợp lệ) thì fallback xuống ghi text
-                            
-                # Ghi text bình thường (cho các cột không phải ảnh hoặc ảnh bị lỗi/thiếu)
+                        thumb = RepairDetailReportCommand._make_thumbnail(img_path)
+                        if thumb is not None:
+                            try:
+                                img = ExcelImage(thumb)
+                                img.width = 100
+                                img.height = 100
+                                cell_address = f"{get_column_letter(col_idx)}{row_idx}"
+                                ws.add_image(img, cell_address)
+                                continue
+                            except Exception:
+                                pass  # fallback xuống ghi text nếu vẫn lỗi
+
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)
                 cell.font = normal_font
                 cell.alignment = center if col_idx in (1, 7, 8, 11) else left
