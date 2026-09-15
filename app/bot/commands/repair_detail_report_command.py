@@ -32,22 +32,26 @@ MONTH_NAMES_VI = [
     "Tháng 7", "Tháng 8", "Tháng 9", "Tháng 10", "Tháng 11", "Tháng 12",
 ]
 
+# Cột đầu tiên "Number" là số thứ tự tự sinh (không lấy từ DB).
+# Các cột còn lại PHẢI khớp đúng thứ tự giá trị trả về từ _build_row().
 DETAIL_COLUMNS = [
     "Number", "Date Receive", "Board ID", "Board Code", "Board Name",
-    "Device Code", "Contractor", "Test Tool Result", "Failure Cause",
-    "Disposition", "After Repair Result", "Charging Station Test Status",
+    "Device Code", "Contractor", "Before Test Photo 1", "Before Test Photo 2",
+    "Test Tool Result", "Failure Cause",
+    "Disposition", "After Repair Result",
+    "After Repair Photo 1", "After Repair Photo 2", "After Repair Photo 3", "Charging Station Test Status",
     "Detailed Remarks", "Ticket ID", "SN", "Date Onsite",
-    "Original Phenomenon", "Station Code", "Push FW",
-    "Repair Photo Path", "Failure Verification Photo Path",
-    "Before Test Photo 1", "Before Test Photo 2",
-    "After Repair Photo 1", "After Repair Photo 2", "After Repair Photo 3",
-    "Created By", "Created At", "Updated By", "Updated At",
+    "Original Phenomenon", "Failure Verification Photo", "Station Code",
 ]
+
+# Header được ghi text căn giữa (các cột dữ liệu ngắn, dạng phân loại).
+# Các cột không có trong set này mặc định căn trái + wrap text.
+CENTER_HEADERS = {"Contractor", "Test Tool Result", "After Repair Result"}
 
 SUMMARY_COLUMNS = [
     "Material Code", "TYPE", "Quality",
     "First Test PASS rate", "After repair Test PASS rate",
-    "Phân tích", "Discard",
+    "Analytics", "Discard",
 ]
 
 
@@ -283,7 +287,7 @@ class RepairDetailReportCommand(BaseCommand):
         return quality, first_pass, after_pass, analytics, discard
 
     # ------------------------------------------------------------------
-    # Build dòng chi tiết (không còn ID, số thứ tự được sinh lúc ghi sheet)
+    # Build dòng chi tiết - thứ tự PHẢI khớp DETAIL_COLUMNS[1:] (bỏ "Number")
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -292,35 +296,29 @@ class RepairDetailReportCommand(BaseCommand):
             return v.value if v else None
 
         return [
-            r.date_receive,
-            r.board_id,
-            r.board_code,
-            board_names.get(r.board_code, r.board_code),
-            r.code,
-            contractor_names.get(r.contractor_id, "-") if r.contractor_id else None,
-            enum_val(r.test_tool_result),
-            r.failure_cause,
-            r.disposition,
-            enum_val(r.after_repair_result),
-            r.charging_station_test_status,
-            r.detailed_remarks,
-            r.ticket_id,
-            r.sn,
-            r.date_onsite,
-            r.original_phenomenon,
-            r.station_code,
-            r.puss_f,
-            r.repair_photo_path,
-            r.failure_verification_photo_path,
-            r.before_test_photo_1,
-            r.before_test_photo_2,
-            r.after_repair_photo_1,
-            r.after_repair_photo_2,
-            r.after_repair_photo_3,
-            user_names.get(r.created_by_id, "-") if r.created_by_id else None,
-            r.created_at.strftime("%d/%m/%Y %H:%M") if r.created_at else None,
-            user_names.get(r.updated_by_id, "-") if r.updated_by_id else None,
-            r.updated_at.strftime("%d/%m/%Y %H:%M") if r.updated_at else None,
+            r.date_receive,                                                          # Date Receive
+            r.board_id,                                                              # Board ID
+            r.board_code,                                                            # Board Code
+            board_names.get(r.board_code, r.board_code),                             # Board Name
+            r.code,                                                                  # Device Code
+            contractor_names.get(r.contractor_id, "-") if r.contractor_id else None, # Contractor
+            r.before_test_photo_1,                                                   # Before Test Photo 1
+            r.before_test_photo_2,                                                   # Before Test Photo 2
+            enum_val(r.test_tool_result),                                            # Test Tool Result
+            r.failure_cause,                                                         # Failure Cause
+            r.disposition,                                                           # Disposition
+            enum_val(r.after_repair_result),                                         # After Repair Result
+            r.after_repair_photo_1,                                                  # After Repair Photo 1
+            r.after_repair_photo_2,                                                  # After Repair Photo 2
+            r.after_repair_photo_3,                                                  # After Repair Photo 3
+            r.charging_station_test_status,                                          # Charging Station Test Status
+            r.detailed_remarks,                                                      # Detailed Remarks
+            r.ticket_id,                                                             # Ticket ID
+            r.sn,                                                                    # SN
+            r.date_onsite,                                                           # Date Onsite
+            r.original_phenomenon,                                                   # Original Phenomenon
+            r.failure_verification_photo_path,                                       # Failure Verification Photo
+            r.station_code,                                                          # Station Code
         ]
 
     # ------------------------------------------------------------------
@@ -363,7 +361,7 @@ class RepairDetailReportCommand(BaseCommand):
 
     def _build_workbook(self, groups, board_names, contractor_names, user_names) -> Path:
         wb = Workbook()
-        used_sheet_names = {"Tổng hợp"}
+        used_sheet_names = {"Total"}
 
         # Sắp xếp board theo tên hiển thị cho dễ nhìn
         ordered_codes = sorted(
@@ -373,7 +371,7 @@ class RepairDetailReportCommand(BaseCommand):
 
         # ---------------- Sheet Tổng hợp ----------------
         ws_summary = wb.active
-        ws_summary.title = "Tổng hợp"
+        ws_summary.title = "Total"
         self._write_summary_sheet(ws_summary, ordered_codes, groups, board_names)
 
         # ---------------- Các sheet chi tiết theo board ----------------
@@ -433,25 +431,22 @@ class RepairDetailReportCommand(BaseCommand):
         center = Alignment(horizontal="center", vertical="center")
         left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-        # Cột ảnh được xác định theo header của các cột DỮ LIỆU (không tính
-        # cột STT), nên offset +1 khi ghi thực tế vì cột 1 luôn là STT.
-        image_data_col_indices = {i for i, h in enumerate(DETAIL_COLUMNS[1:], start=1) if "Photo" in h}
+        # Xác định cột ảnh / cột căn giữa theo TÊN HEADER (không hard-code
+        # index) để tránh lệch khi thay đổi thứ tự DETAIL_COLUMNS về sau.
+        image_col_indices = {i for i, h in enumerate(DETAIL_COLUMNS, start=1) if "Photo" in h}
+        center_col_indices = {i for i, h in enumerate(DETAIL_COLUMNS, start=1) if h in CENTER_HEADERS}
 
-        # Format header - cột 1 luôn là "STT"
+        # Format header
         for col_idx, h in enumerate(DETAIL_COLUMNS, start=1):
             cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = center
+            ws.column_dimensions[get_column_letter(col_idx)].width = 25 if col_idx in image_col_indices else 20
 
-            if col_idx - 1 in image_data_col_indices:
-                ws.column_dimensions[get_column_letter(col_idx)].width = 25
-            else:
-                ws.column_dimensions[get_column_letter(col_idx)].width = 20
+        ws.column_dimensions[get_column_letter(1)].width = 8  # Number (STT)
 
-        ws.column_dimensions[get_column_letter(1)].width = 8  # STT
-
-        # Ghi dữ liệu từng dòng - cột 1 là số thứ tự tự sinh (1, 2, 3...)
+        # Ghi dữ liệu từng dòng - cột 1 ("Number") là số thứ tự tự sinh
         for row_idx, row_values in enumerate(rows, start=2):
             ws.row_dimensions[row_idx].height = 80
 
@@ -461,9 +456,9 @@ class RepairDetailReportCommand(BaseCommand):
             stt_cell.alignment = center
 
             for offset, value in enumerate(row_values, start=1):
-                col_idx = offset + 1  # +1 vì cột 1 đã dùng cho STT
+                col_idx = offset + 1  # +1 vì cột 1 đã dùng cho "Number"
 
-                if offset in image_data_col_indices and value:
+                if col_idx in image_col_indices and value:
                     img_path = Path(value)
                     if img_path.is_file():
                         thumb = RepairDetailReportCommand._make_thumbnail(img_path)
@@ -480,6 +475,6 @@ class RepairDetailReportCommand(BaseCommand):
 
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)
                 cell.font = normal_font
-                cell.alignment = center if col_idx in (7, 8, 11) else left
+                cell.alignment = center if col_idx in center_col_indices else left
 
         ws.freeze_panes = "A2"
