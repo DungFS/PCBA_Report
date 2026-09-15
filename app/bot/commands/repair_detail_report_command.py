@@ -33,7 +33,7 @@ MONTH_NAMES_VI = [
 ]
 
 DETAIL_COLUMNS = [
-    "ID", "Date Receive", "Board ID (gốc)", "Board Code", "Board Name",
+    "Number", "Date Receive", "Board ID", "Board Code", "Board Name",
     "Device Code", "Contractor", "Test Tool Result", "Failure Cause",
     "Disposition", "After Repair Result", "Charging Station Test Status",
     "Detailed Remarks", "Ticket ID", "SN", "Date Onsite",
@@ -47,7 +47,7 @@ DETAIL_COLUMNS = [
 SUMMARY_COLUMNS = [
     "Material Code", "TYPE", "Quality",
     "First Test PASS rate", "After repair Test PASS rate",
-    "Analytics", "Discard",
+    "Phân tích", "Discard",
 ]
 
 
@@ -198,7 +198,8 @@ class RepairDetailReportCommand(BaseCommand):
 
         Kết quả xuất ra 1 file xlsx nhiều sheet:
         - Sheet đầu "Tổng hợp": group theo board, đếm Quality / PASS rate / Discard.
-        - Các sheet sau: 1 sheet / board, liệt kê chi tiết từng repair (kèm ảnh).
+        - Các sheet sau: 1 sheet / board, liệt kê chi tiết từng repair (kèm ảnh),
+          đánh số thứ tự 1..n theo thứ tự hiển thị trong sheet đó.
         """
         try:
             with SessionLocal() as db:
@@ -282,7 +283,7 @@ class RepairDetailReportCommand(BaseCommand):
         return quality, first_pass, after_pass, analytics, discard
 
     # ------------------------------------------------------------------
-    # Build dòng chi tiết
+    # Build dòng chi tiết (không còn ID, số thứ tự được sinh lúc ghi sheet)
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -291,7 +292,6 @@ class RepairDetailReportCommand(BaseCommand):
             return v.value if v else None
 
         return [
-            r.id,
             r.date_receive,
             r.board_id,
             r.board_code,
@@ -433,30 +433,37 @@ class RepairDetailReportCommand(BaseCommand):
         center = Alignment(horizontal="center", vertical="center")
         left = Alignment(horizontal="left", vertical="center", wrap_text=True)
 
-        # Nhận diện các cột chứa hình ảnh (có chữ "Photo" trong tiêu đề)
-        image_col_indices = {i for i, h in enumerate(DETAIL_COLUMNS, start=1) if "Photo" in h}
+        # Cột ảnh được xác định theo header của các cột DỮ LIỆU (không tính
+        # cột STT), nên offset +1 khi ghi thực tế vì cột 1 luôn là STT.
+        image_data_col_indices = {i for i, h in enumerate(DETAIL_COLUMNS[1:], start=1) if "Photo" in h}
 
-        # Format header
+        # Format header - cột 1 luôn là "STT"
         for col_idx, h in enumerate(DETAIL_COLUMNS, start=1):
             cell = ws.cell(row=1, column=col_idx, value=h)
             cell.font = header_font
             cell.fill = header_fill
             cell.alignment = center
 
-            if col_idx in image_col_indices:
+            if col_idx - 1 in image_data_col_indices:
                 ws.column_dimensions[get_column_letter(col_idx)].width = 25
             else:
                 ws.column_dimensions[get_column_letter(col_idx)].width = 20
 
-        ws.column_dimensions[get_column_letter(1)].width = 8  # ID
+        ws.column_dimensions[get_column_letter(1)].width = 8  # STT
 
-        # Ghi dữ liệu từng dòng
+        # Ghi dữ liệu từng dòng - cột 1 là số thứ tự tự sinh (1, 2, 3...)
         for row_idx, row_values in enumerate(rows, start=2):
             ws.row_dimensions[row_idx].height = 80
 
-            for col_idx, value in enumerate(row_values, start=1):
-                # Xử lý nếu đây là cột ảnh và có dữ liệu đường dẫn
-                if col_idx in image_col_indices and value:
+            stt = row_idx - 1
+            stt_cell = ws.cell(row=row_idx, column=1, value=stt)
+            stt_cell.font = normal_font
+            stt_cell.alignment = center
+
+            for offset, value in enumerate(row_values, start=1):
+                col_idx = offset + 1  # +1 vì cột 1 đã dùng cho STT
+
+                if offset in image_data_col_indices and value:
                     img_path = Path(value)
                     if img_path.is_file():
                         thumb = RepairDetailReportCommand._make_thumbnail(img_path)
@@ -471,9 +478,8 @@ class RepairDetailReportCommand(BaseCommand):
                             except Exception:
                                 pass  # fallback xuống ghi text nếu vẫn lỗi
 
-                # Ghi text bình thường (cho các cột không phải ảnh hoặc ảnh bị lỗi/thiếu)
                 cell = ws.cell(row=row_idx, column=col_idx, value=value)
                 cell.font = normal_font
-                cell.alignment = center if col_idx in (1, 7, 8, 11) else left
+                cell.alignment = center if col_idx in (7, 8, 11) else left
 
         ws.freeze_panes = "A2"
