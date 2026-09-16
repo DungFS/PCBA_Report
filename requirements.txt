@@ -2,4 +2,10 @@ fastapi==0.141.1
 openpyxl==3.1.5
 pyTelegramBotAPI==4.36.1
 python-dotenv==1.2.3
+requests==2.32.3
+# Dùng cho RAG local trong /ask (app/services/embedding_service.py) - kéo
+# theo torch, khá nặng (~500MB-1GB tuỳ nền tảng). Nếu server không có GPU
+# và muốn giảm dung lượng tải, cài torch bản CPU-only TRƯỚC khi cài file
+# này: pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers==3.3.1
 SQLAlchemy==2.0.52
