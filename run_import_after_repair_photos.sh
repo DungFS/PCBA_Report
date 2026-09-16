@@ -39,5 +39,14 @@ fi
 
 # Đảm bảo Python tìm được package "app" dù chạy từ đâu
 export PYTHONPATH="$SCRIPT_DIR:${PYTHONPATH:-}"
+PYTHON_CMD="python"
 
-python3 scripts/import_after_repair_photos.py "$XLSX_FILE"
+if ! command -v "$PYTHON_CMD" >/dev/null 2>&1; then
+    echo "❌ Không tìm thấy Python."
+    exit 1
+fi
+
+echo "Python đang sử dụng:"
+"$PYTHON_CMD" --version
+
+"$PYTHON_CMD" scripts/import_after_repair_photos.py "$XLSX_FILE"
