@@ -106,7 +106,7 @@ class Repair(Base, AuditMixin):
         comment="Ghi chú chi tiết về lỗi/cách sửa, có thể kèm tên người phân tích"
     )
     ticket_id = Column(
-        String(100), nullable=True, index=True, unique=True,
+        String(100), nullable=True, index=True,
         comment="Mã phiếu yêu cầu sửa chữa, dùng để tra cứu chéo hệ thống khác"
     )
     sn = Column(
