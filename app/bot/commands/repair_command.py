@@ -748,13 +748,15 @@ class RepairCommand(BaseCommand):
 
             if not existing_codes:
                 # Không có thiết bị nào của board này trong các lần sửa trước
-                # -> tự tạo code mới, không cần hỏi.
-                new_code = Repair.generate_code(db, board_code)
-                self._add_sessions[chat_id]["code"] = new_code
+                # -> sẽ tự tạo code mới, nhưng CHỈ gen thật (Repair.generate_code)
+                # tại thời điểm lưu (_finalize_add) - tránh "ăn" mất số thứ tự
+                # nếu wizard bị hủy giữa chừng, hoặc kết quả test cuối cùng là
+                # Discard (Discard thì code phải để trống, xem _handle_add_test_selected).
+                self._add_sessions[chat_id]["_new_device"] = True
                 self.bot.send_message(
                     chat_id,
                     f"ℹ️ Chưa có thiết bị nào của board '{board_code}' trước đây.\n"
-                    f"Đã tự tạo mã thiết bị mới: {new_code}"
+                    f"Mã thiết bị mới sẽ được tự động tạo khi lưu record."
                 )
                 self._ask_contractor(chat_id)
                 return
@@ -787,12 +789,11 @@ class RepairCommand(BaseCommand):
             self.bot.send_message(chat_id, "⚠️ Phiên đã hết hạn. Gõ /repair add để bắt đầu lại.")
             return
 
-        board_code = session["board_code"]
-        with SessionLocal() as db:
-            code = Repair.generate_code(db, board_code)
-        session["code"] = code
+        # Không gen code ngay - chỉ đánh dấu để _finalize_add tự gen tại thời
+        # điểm lưu (xem ghi chú trong _handle_add_board_selected).
+        session["_new_device"] = True
         session.pop("_device_choices", None)
-        self.bot.send_message(chat_id, f"✅ Đã tạo mã thiết bị mới: {code}")
+        self.bot.send_message(chat_id, "✅ Sẽ tạo mã thiết bị mới khi lưu record.")
         self._ask_contractor(chat_id)
 
     def _process_add_device_exact(self, message):
@@ -905,6 +906,11 @@ class RepairCommand(BaseCommand):
 
         if value == "DISCARD":
             self._add_sessions[chat_id]["disposition"] = "Discard"
+            # Discard -> không cần định danh thiết bị (code) nữa, để null.
+            # Ghi đè cả trường hợp thiết bị có sẵn (code đã chọn) lẫn thiết bị
+            # mới (chưa gen, chỉ có cờ _new_device) - đều bị null hóa ở đây.
+            self._add_sessions[chat_id]["code"] = None
+            self._add_sessions[chat_id]["_new_device"] = False
             self._ask_ticket_id(chat_id)
         elif value == "PASS":
             self._ask_ticket_id(chat_id)
@@ -1139,9 +1145,13 @@ class RepairCommand(BaseCommand):
             self.bot.register_next_step_handler(msg, self._guarded(self._process_add_manual_failure_photo))
             return
 
-        code = self._add_sessions[chat_id].get("code", "unknown")
+        session = self._add_sessions[chat_id]
+        # Nếu là thiết bị mới, code thật chưa được gen (chỉ gen tại
+        # _finalize_add) - dùng board_code làm tên file tạm cho dễ đọc, thay
+        # vì rơi vào "unknown".
+        code_for_filename = session.get("code") or session.get("board_code", "unknown")
         try:
-            photo_path = self._save_uploaded_photo(message, code)
+            photo_path = self._save_uploaded_photo(message, code_for_filename)
         except Exception as e:
             msg = self.bot.reply_to(
                 message,
@@ -1160,12 +1170,21 @@ class RepairCommand(BaseCommand):
 
         with SessionLocal() as db:
             try:
+                # Chỉ gen code MỚI (Repair.generate_code) tại đúng thời điểm
+                # lưu, để không "ăn" số thứ tự nếu wizard bị hủy giữa chừng.
+                # Nếu kết quả test cuối cùng là Discard thì code luôn là None
+                # (đã set + tắt cờ _new_device ở _handle_add_test_selected).
+                code = data.get("code")
+                if data.get("_new_device") and data.get("test_tool_result") != "DISCARD":
+                    code = Repair.generate_code(db, data.get("board_code"))
+                    data["code"] = code  # để phần summary bên dưới hiện đúng giá trị
+
                 repair = Repair(
                     date_receive=datetime.now().date(),
                     board_id=data.get("board_name") or data.get("board_code"),
                     board_code=data.get("board_code"),
                     contractor_id=data.get("contractor_id"),
-                    code=data.get("code"),
+                    code=code,
                     test_tool_result=self._to_enum(data.get("test_tool_result")),
                     failure_cause=data.get("failure_cause"),
                     disposition=data.get("disposition"),
@@ -1198,7 +1217,7 @@ class RepairCommand(BaseCommand):
         summary_lines = [
             f"✅ Đã tạo Repair #{repair_id}",
             f"  Board: {data.get('board_code')}",
-            f"  Thiết bị (code): {data.get('code')}",
+            f"  Thiết bị (code): {data.get('code') or '-'}",
             f"  Test tool result: {data.get('test_tool_result')}",
         ]
         if data.get("test_tool_result") == "DISCARD":
@@ -1303,9 +1322,12 @@ class RepairCommand(BaseCommand):
             self.bot.register_next_step_handler(msg, self._guarded(self._process_photo_batch))
             return
 
-        code = session.get("code", "unknown")
+        # Nếu là thiết bị mới, code thật chưa được gen (chỉ gen tại
+        # _finalize_add) - dùng board_code làm tên file tạm cho dễ đọc, thay
+        # vì rơi vào "unknown".
+        code_for_filename = session.get("code") or session.get("board_code", "unknown")
         try:
-            photo_path = self._save_uploaded_photo(message, code)
+            photo_path = self._save_uploaded_photo(message, code_for_filename)
         except Exception as e:
             msg = self.bot.reply_to(message, f"❌ Lưu ảnh thất bại: {e}\nGửi lại, hoặc gõ 'xong':")
             self.bot.register_next_step_handler(msg, self._guarded(self._process_photo_batch))
